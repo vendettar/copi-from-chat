@@ -6,7 +6,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { normalizeContext } from '@earendil-works/pi-ai';
-import { createCopilotProvider, parseReply } from '../src/pi-provider.js';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+import {
+  compactWireSystemPrompt, compactWireTools, createCopilotProvider, parseReply, promptFor
+} from '../src/pi-provider.js';
+import { createRuntime } from '../src/runtime.js';
 import { exportSessionToFile } from '../src/export.js';
 import { ensureCopiDirs, getCopiPaths } from '../src/paths.js';
 import { runPostEditSyntaxCheck } from '../src/post-edit-check.js';
@@ -227,4 +231,165 @@ test('custom prompt templates and Markdown session export work cleanly', async t
   assert.match(md, /`src\/a\.js`/);
   assert.match(md, /### You[\s\S]*Optimize quota usage/);
   assert.match(md, /### Copi[\s\S]*All done/);
+});
+
+test('lean continue header, compact bootstrap wire schemas, and <docs> stripping drastically reduce wire overhead', () => {
+  const contPrompt = promptFor({
+    mode: 'continue',
+    requestId: 'req-123',
+    sessionId: 's-1',
+    previousRequestId: 'req-122',
+    messages: [{ role: 'user', content: 'hi' }]
+  });
+  // Header without JSON payload should be ~450-550 chars (down from 3,115 chars in v0.1.0).
+  const contHeader = contPrompt.split('\nTASK_CONTEXT_JSON:\n')[0];
+  assert.ok(contHeader.length < 650, `Expected continue header < 650 chars, got ${contHeader.length}`);
+  assert.match(contPrompt, /\nTASK_CONTEXT_JSON:\n/);
+  assert.match(contPrompt, /<<<COPILOT_REPLY_START:req-123>>>/);
+
+  const bloatedSys = 'Intro.\n\n<tools>\n- read: Read\n</tools>\n\n<rules>\n- Be concise\n</rules>\n\n<docs>\nPi docs: ' + 'x'.repeat(1200) + '\n</docs>\n\n<addendum>\nKeep this.\n</addendum>';
+  const compactSys = compactWireSystemPrompt(bloatedSys);
+  assert.doesNotMatch(compactSys, /<docs>|<tools>/);
+  assert.match(compactSys, /<rules>[\s\S]*Be concise/);
+  assert.match(compactSys, /<addendum>[\s\S]*Keep this/);
+  assert.ok(compactSys.length < 250);
+
+  const verboseTools = [{
+    name: 'read',
+    description: 'Read the contents of a file. Supports text files and images (jpg, png). Output is truncated to 2000 lines.',
+    constrainedSampling: { type: 'json_schema', strict: 'prefer' },
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['path'],
+      properties: { path: { type: 'string', description: 'Path to file' } }
+    }
+  }];
+  const compactTools = compactWireTools(verboseTools);
+  assert.equal(compactTools[0].constrainedSampling, undefined);
+  assert.equal(compactTools[0].parameters.additionalProperties, undefined);
+  assert.doesNotMatch(compactTools[0].description, /images/);
+});
+
+test('plain workspace paths auto-preload without @ (including CJK boundaries) while skipping URLs, emails, and ignored dirs', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'copi-auto-preload-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'));
+  await mkdir(join(root, 'node_modules/pkg'), { recursive: true });
+  await writeFile(join(root, 'src/app.js'), 'export const answer = 42;\nexport const extra = 99;\n');
+  await writeFile(join(root, 'package.json'), '{"name":"plain-demo"}\n');
+  await writeFile(join(root, 'node_modules/pkg/dep.js'), 'export const dep = true;\n');
+
+  const res = await expandFileMentions(
+    '请修复src/app.js:1-1里的问题，顺便看下 package.json，忽略 https://example.com/src/app.js、user@example.com 和 node_modules/pkg/dep.js',
+    root
+  );
+  assert.deepEqual(res.loadedFiles, ['src/app.js (lines 1-1)', 'package.json']);
+  assert.match(res.text, /1: export const answer = 42;/);
+  assert.match(res.text, /"name":"plain-demo"/);
+  assert.doesNotMatch(res.text, /export const dep/);
+});
+
+test('sequential tool execution runs [write, edit, bash] in strict order within ONE web turn', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'copi-seq-tools-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'repo');
+  const agentDir = join(root, 'agent');
+  await mkdir(cwd);
+
+  let askCount = 0;
+  let capturedResults = [];
+  const rt = await createRuntime({
+    cwd,
+    agentDir,
+    sessionManager: SessionManager.inMemory(cwd),
+    preloadWorkspace: false,
+    browser: {
+      async ask(prompt) {
+        askCount++;
+        const req = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+        if (askCount === 1) {
+          // Single web turn chaining write -> edit -> bash cat!
+          return mkReply(req, {
+            type: 'tool_calls',
+            calls: [
+              { name: 'write', arguments: { path: 'seq.txt', content: 'step-one\n' } },
+              { name: 'edit', arguments: { path: 'seq.txt', edits: [{ oldText: 'step-one', newText: 'step-two' }] } },
+              { name: 'bash', arguments: { command: 'cat seq.txt' } }
+            ]
+          });
+        }
+        capturedResults = req.messages.filter(m => m.role === 'toolResult');
+        return mkReply(req, { type: 'final', lines: ['All 3 steps verified in one turn.'] });
+      },
+      async close() {}
+    }
+  });
+  await rt.session.bindExtensions({});
+  await rt.session.prompt('Create, edit, and verify seq.txt.');
+  assert.equal(askCount, 2); // Only 2 web turns total instead of 4!
+  assert.equal(capturedResults.length, 3);
+  assert.ok(capturedResults.every(r => !r.isError));
+  assert.match(capturedResults[2].content[0].text, /step-two/);
+  assert.equal(await readFile(join(cwd, 'seq.txt'), 'utf8'), 'step-two\n');
+});
+
+test('same-tab unchanged read deduplication omits repeated file bodies and char-budget rotation refreshes the tab', async () => {
+  const readTool = {
+    name: 'read',
+    description: 'Read',
+    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+  };
+  const body = 'line\n'.repeat(200); // 1000 chars (> 400 dedup threshold)
+  const modifiedBody = 'changed\n'.repeat(120);
+  const requests = [];
+  const control = {};
+  const provider = createCopilotProvider({
+    async ask(prompt, options) {
+      const req = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+      requests.push({ req, fresh: options.fresh, promptLen: prompt.length });
+      if (requests.length === 1 || requests.length === 3 || requests.length === 5) {
+        return mkReply(req, { type: 'tool_calls', calls: [{ name: 'read', arguments: { path: 'src/big.js' } }] });
+      }
+      return mkReply(req, { type: 'final', lines: ['ok'] });
+    }
+  }, {
+    autoRotateTurns: 25,
+    autoRotateChars: 3500,
+    minTurnsForCharRotate: 4,
+    control
+  });
+
+  const run = async msgs => {
+    const s = provider.streamSimple(provider.getModels()[0], normalizeContext({ systemPrompt: 'Work.', messages: msgs, tools: [readTool] }), { sessionId: 'dedup-s' });
+    for await (const _ of s) {}
+    return s.result();
+  };
+
+  let msgs = [user('First read')];
+  const a1 = await run(msgs);
+  const tr1 = { role: 'toolResult', toolCallId: a1.content[0].id, toolName: 'read', isError: false, content: [{ type: 'text', text: body }], timestamp: 2 };
+  msgs = [...msgs, a1, tr1];
+  const a2 = await run(msgs);
+  assert.equal(requests[1].req.messages[0].content[0].text, body); // 1st read sent in full
+
+  // 2nd identical read in SAME tab -> deduped to 1-line stub!
+  msgs = [...msgs, a2, user('Read again')];
+  const a3 = await run(msgs);
+  const tr2 = { role: 'toolResult', toolCallId: a3.content[0].id, toolName: 'read', isError: false, content: [{ type: 'text', text: body }], timestamp: 3 };
+  msgs = [...msgs, a3, tr2];
+  const a4 = await run(msgs);
+  assert.match(requests[3].req.messages[0].content[0].text, /Already read in this web conversation/);
+
+  // 3rd read with MODIFIED file content -> sent in full!
+  msgs = [...msgs, a4, user('Read modified')];
+  const a5 = await run(msgs);
+  // Note: by now webTurnsInTab >= 4 AND webCharsInTab >= 3500, so this user boundary rotated to a fresh tab!
+  assert.equal(requests[4].fresh, true);
+  assert.equal(requests[4].req.mode, 'bootstrap');
+
+  const tr3 = { role: 'toolResult', toolCallId: a5.content[0].id, toolName: 'read', isError: false, content: [{ type: 'text', text: modifiedBody }], timestamp: 4 };
+  msgs = [...msgs, a5, tr3];
+  await run(msgs);
+  assert.equal(requests[5].req.messages[0].content[0].text, modifiedBody);
 });

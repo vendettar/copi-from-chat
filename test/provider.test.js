@@ -351,7 +351,7 @@ test('parallel tool results share a budget while retaining every call ID and sma
   });
   const first = await h.run();
   const results = first.content.map((call, i) => ({ role: 'toolResult', toolCallId: call.id, toolName: 'bash',
-    isError: i === 7, content: [{ type: 'text', text: i ? `CHECK_${i}\n` + 'quoted "\\🙂\n'.repeat(2000) + `\nEND_${i}` : 'Small result.' }], timestamp: 2 }));
+    isError: i === 7, content: [{ type: 'text', text: i ? `CHECK_${i}\n` + Array.from({ length: 1200 }, (_, n) => `row-${n}: quoted "\\🙂`).join('\n') + `\nEND_${i}` : 'Small result.' }], timestamp: 2 }));
   const answer = await h.run({ ...base, messages: [...base.messages, first, ...results] });
   assert.equal(answer.stopReason, 'stop');
   const outgoing = h.requests[1].request.messages;

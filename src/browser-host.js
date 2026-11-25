@@ -56,7 +56,7 @@ export async function startBrowserHost({
   channel = process.platform === 'win32' ? 'msedge' : 'chrome',
   headless = false,
   context: injectedContext = null,
-  version = '0.1.0',
+  version = '0.1.1',
   idleTimeoutMinutes,
   sendConfirmTimeoutMs,
   sendConfirmPollMs,
@@ -393,6 +393,8 @@ export async function startBrowserHost({
             code: error?.code,
             beforeSend: error?.beforeSend,
             retryableInFreshChat: error?.retryableInFreshChat,
+            limitNotice: error?.limitNotice,
+            effectivePref: error?.effectivePref,
             uncertain: entry.tab.uncertain
           });
         } finally {

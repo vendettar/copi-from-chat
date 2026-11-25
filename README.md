@@ -40,9 +40,10 @@ Launching `copi` in interactive mode immediately opens the shared Edge window in
 
 M365 Copilot enforces a strict daily cap on `深度思考 / Think deeper`, while `快速响应 / Quick response` and `自动 / Auto` have much larger allowances. `copi` maximizes work per daily quota automatically:
 
-- **`smart` mode (default)**: uses `深度思考 / Think deeper` on your main prompt and automatically steps down to `快速响应 / Quick response` for mechanical tool-result follow-ups. If M365 reports a `Think deeper` daily limit, Copi marks it for today in `~/.copi/quota.json`, switches to `quick`, and continues cleanly without crashing.
-- **Zero-turn local pre-context**: new conversations locally preload a compact workspace snapshot (branch, `git status`, manifest, file tree) and expand `@path/to/file` / `@path/to/file:10-80` mentions (plus piped `stdin`), eliminating 2–4 exploratory web round-trips.
-- **Multi-tool batching & local syntax checks**: prompts instruct Copilot to batch independent reads/searches/edits and chain commands with `&&`; `write`/`edit` on `.js`/`.json` files automatically attach a zero-quota local syntax check right in the tool result.
+- **`smart` mode (default)**: uses `深度思考 / Think deeper` on your main prompt and automatically steps down to `快速响应 / Quick response` for mechanical tool-result follow-ups. If M365 reports a `Think deeper` daily limit (in either a reply bubble or a page-level `[role="alert"]` / toast banner), Copi marks it for today in `~/.copi/quota.json`, switches to `quick`, and continues cleanly without crashing.
+- **Ultra-lean wire payloads & adaptive rotation**: `continue` turns trim repeated protocol boilerplate by ~83%, `bootstrap` strips Pi harness `<docs>` and compacts tool schemas (~55% smaller), identical unchanged `read` calls within the same live tab are deduplicated on the wire, and long tabs auto-rotate cleanly by both turn count (25) and character budget (~60K chars).
+- **Zero-turn local pre-context**: new conversations locally preload a compact workspace snapshot (branch, `git status`, manifest, file tree) and expand both explicit `@path/to/file[:start-end]` mentions and plain relative workspace file paths (plus piped `stdin`), eliminating exploratory `read` round-trips.
+- **Sequential single-turn tool chaining & output denoising**: tool calls run sequentially in array order so Copilot can safely emit `[edit, bash("npm test")]` in **one** web turn (~33% fewer turns per edit); `bash` output strips ANSI codes, collapses `\r` progress bars, and folds duplicate lines before the 5K/10K budget; `write`/`edit` on `.js`/`.json` files automatically attach a zero-quota local syntax check right in the tool result.
 - **Zero-cost plain-text & trailing-comma recovery**: clean plain-text final answers are accepted locally without burning a `mode: 'repair'` quota turn.
 - **One-shot `/think <prompt>`**: even when using `/model quick` or `/model auto`, run `/think <question>` to use `Think deeper` for a single turn and automatically return to your previous preference.
 - **Index-based compatibility**: `/model` reads live options from Edge and matches by positional index (`smart`, `quick`, `auto`, `think`, or `0..N`), staying resilient across Chinese/English UI and future model renames.
@@ -134,10 +135,10 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.1.0.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.1.1.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.1.0.tgz
+npm install -g ./copi-from-chat-0.1.1.tgz
 copi --help
 ```
 

@@ -10,6 +10,9 @@ const MAX_SNAPSHOT_CHARS = 3500;
 const MAX_PRELOAD_FILES = 4;
 const MAX_PRELOAD_FILE_CHARS = 4000;
 const MAX_PRELOAD_TOTAL_CHARS = 10000;
+const MAX_AUTO_PRELOAD_FILES = 2;
+const MAX_AUTO_PRELOAD_FILE_CHARS = 2500;
+const MAX_AUTO_PRELOAD_TOTAL_CHARS = 4000;
 
 async function listWorkspaceFiles(cwd, limit = MAX_SNAPSHOT_FILES) {
   try {
@@ -98,66 +101,129 @@ export async function collectWorkspaceSnapshot(cwd, { maxChars = MAX_SNAPSHOT_CH
   return full.length <= maxChars ? full : `${full.slice(0, maxChars)}\n... [snapshot truncated]`;
 }
 
-// Match @path/to/file or @path/to/file:10-80 preceded by start-of-string or whitespace (never emails).
-const FILE_MENTION = /(?:^|[\s(])@([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)(?::(\d+)(?:-(\d+))?)?/g;
+// Match @path/to/file or @path/to/file:10-80 preceded by start-of-string, whitespace, or CJK/punctuation (never emails).
+const FILE_MENTION = /(?:^|[\s([{"'`，。！？、；：])@([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)(?::(\d+)(?:-(\d+))?)?/g;
+// Match plain relative workspace file paths (e.g. src/browser.js, package.json, test/a.js:10-40) without needing @.
+// Avoids URLs, emails, and path fragments preceded by @, :, /, or alphanumeric chars.
+const PLAIN_FILE_PATH = /(?<![A-Za-z0-9_@:/\\.-])((?:\.[\\/])?(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{1,10})(?::(\d+)(?:-(\d+))?)?(?![A-Za-z0-9_/.:-])/g;
+
+function hasIgnoredSegment(relPath) {
+  return relPath.split('/').some(seg => IGNORED_DIRS.has(seg));
+}
 
 export async function expandFileMentions(prompt, cwd, {
   maxFiles = MAX_PRELOAD_FILES,
   maxFileChars = MAX_PRELOAD_FILE_CHARS,
-  maxTotalChars = MAX_PRELOAD_TOTAL_CHARS
+  maxTotalChars = MAX_PRELOAD_TOTAL_CHARS,
+  includePlainPaths = true,
+  maxAutoFiles = MAX_AUTO_PRELOAD_FILES,
+  maxAutoFileChars = MAX_AUTO_PRELOAD_FILE_CHARS,
+  maxAutoTotalChars = MAX_AUTO_PRELOAD_TOTAL_CHARS
 } = {}) {
-  if (typeof prompt !== 'string' || !prompt.includes('@') || !cwd) {
-    return { text: prompt, loadedFiles: [] };
+  if (typeof prompt !== 'string' || !prompt.trim() || !cwd) {
+    return { text: prompt, loadedFiles: [], loadedEntries: [] };
+  }
+  // Fast exit for plain prose with no @ mentions and no filename.ext tokens.
+  if (!prompt.includes('@') && !/[A-Za-z0-9_-]\.[A-Za-z0-9_-]{1,10}\b/.test(prompt)) {
+    return { text: prompt, loadedFiles: [], loadedEntries: [] };
   }
 
   const root = resolve(cwd);
-  const seen = new Set();
+  const seenKeys = new Set();
+  const seenFiles = new Set();
   const blocks = [];
   const loadedFiles = [];
+  const loadedEntries = [];
   let totalChars = 0;
+  let autoCount = 0;
+  let autoChars = 0;
 
-  for (const match of prompt.matchAll(FILE_MENTION)) {
-    if (blocks.length >= maxFiles || totalChars >= maxTotalChars) break;
-    const rawRel = match[1].replaceAll('\\', '/');
-    const startLine = match[2] ? Math.max(1, Number(match[2])) : null;
-    const endLine = match[3] ? Math.max(startLine ?? 1, Number(match[3])) : null;
+  const tryLoad = async (rawPath, startStr, endStr, { explicit }) => {
+    if (blocks.length >= maxFiles || totalChars >= maxTotalChars) return;
+    if (!explicit && (autoCount >= maxAutoFiles || autoChars >= maxAutoTotalChars)) return;
+
+    const rawRel = rawPath.replaceAll('\\', '/');
+    const startLine = startStr ? Math.max(1, Number(startStr)) : null;
+    const endLine = endStr ? Math.max(startLine ?? 1, Number(endStr)) : null;
     const target = resolve(root, rawRel);
     const rel = relative(root, target);
-    if (!rel || rel === '..' || rel.startsWith('..') || isAbsolute(rel)) continue;
-    const key = `${rel}:${startLine ?? ''}:${endLine ?? ''}`;
-    if (seen.has(key)) continue;
+    if (!rel || rel === '..' || rel.startsWith('..') || isAbsolute(rel)) return;
+    const displayPath = rel.replaceAll('\\', '/');
+    if (!explicit && hasIgnoredSegment(displayPath)) return;
+
+    const key = `${displayPath}:${startLine ?? ''}:${endLine ?? ''}`;
+    if (seenKeys.has(key)) return;
+    // If an explicit @file already loaded this file (even a line range), don't auto-preload it again.
+    if (!explicit && seenFiles.has(displayPath)) return;
 
     const info = await stat(target).catch(() => null);
-    if (!info || !info.isFile() || info.size > 512 * 1024) continue;
+    const maxBytes = explicit ? 512 * 1024 : 256 * 1024;
+    if (!info || !info.isFile() || info.size > maxBytes) return;
 
     let raw;
-    try { raw = await readFile(target, 'utf8'); } catch { continue; }
-    if (raw.includes('\0')) continue; // Skip binary files.
+    try { raw = await readFile(target, 'utf8'); } catch { return; }
+    if (raw.includes('\0')) return; // Skip binary files.
 
     let snippet = raw;
     let rangeLabel = '';
+    let effectiveEnd = null;
     if (startLine !== null) {
       const lines = raw.split(/\r?\n/);
-      const to = endLine ?? Math.min(lines.length, startLine + 120);
-      snippet = lines.slice(startLine - 1, to).map((line, i) => `${startLine + i}: ${line}`).join('\n');
-      rangeLabel = ` (lines ${startLine}-${Math.min(lines.length, to)})`;
+      effectiveEnd = Math.min(lines.length, endLine ?? Math.min(lines.length, startLine + 120));
+      snippet = lines.slice(startLine - 1, effectiveEnd).map((line, i) => `${startLine + i}: ${line}`).join('\n');
+      rangeLabel = ` (lines ${startLine}-${effectiveEnd})`;
     }
 
-    const budget = Math.min(maxFileChars, maxTotalChars - totalChars);
-    if (budget < 128) break;
+    const perFileLimit = explicit ? maxFileChars : maxAutoFileChars;
+    const remainingTotal = maxTotalChars - totalChars;
+    const remainingAuto = explicit ? remainingTotal : (maxAutoTotalChars - autoChars);
+    const budget = Math.min(perFileLimit, remainingTotal, remainingAuto);
+    if (budget < 128) return;
+
+    let truncated = false;
     if (snippet.length > budget) {
       snippet = `${snippet.slice(0, budget)}\n... [truncated; use read with offset/limit for more]`;
+      truncated = true;
     }
-    seen.add(key);
-    const displayPath = rel.replaceAll('\\', '/');
+
+    seenKeys.add(key);
+    seenFiles.add(displayPath);
     loadedFiles.push(`${displayPath}${rangeLabel}`);
-    blocks.push(`--- @${displayPath}${rangeLabel} ---\n${snippet}`);
+    loadedEntries.push({
+      path: displayPath,
+      startLine,
+      endLine: effectiveEnd,
+      content: startLine === null ? raw : raw.split(/\r?\n/).slice(startLine - 1, effectiveEnd).join('\n'),
+      truncated,
+      explicit
+    });
+    const prefix = explicit ? '@' : '';
+    blocks.push(`--- ${prefix}${displayPath}${rangeLabel} ---\n${snippet}`);
     totalChars += snippet.length;
+    if (!explicit) {
+      autoCount++;
+      autoChars += snippet.length;
+    }
+  };
+
+  // Pass 1: explicit @path/to/file mentions (higher priority & budget).
+  if (prompt.includes('@')) {
+    for (const match of prompt.matchAll(FILE_MENTION)) {
+      await tryLoad(match[1], match[2], match[3], { explicit: true });
+    }
   }
 
-  if (!blocks.length) return { text: prompt, loadedFiles: [] };
+  // Pass 2: natural plain workspace paths (no @ required) verified on disk.
+  if (includePlainPaths) {
+    for (const match of prompt.matchAll(PLAIN_FILE_PATH)) {
+      await tryLoad(match[1], match[2], match[3], { explicit: false });
+    }
+  }
+
+  if (!blocks.length) return { text: prompt, loadedFiles: [], loadedEntries: [] };
   return {
-    text: `${prompt}\n\n[Preloaded @file context — already read locally, no need to re-read these sections]\n${blocks.join('\n\n')}`,
-    loadedFiles
+    text: `${prompt}\n\n[Preloaded file context — already read locally, no need to re-read these sections]\n${blocks.join('\n\n')}`,
+    loadedFiles,
+    loadedEntries
   };
 }

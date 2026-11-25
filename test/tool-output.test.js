@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, rm } from 'node:fs/promises';
-import { limitToolResults, PER_RESULT_TOOL_TEXT_BUDGET, TOOL_TEXT_BUDGET } from '../src/tool-output.js';
+import { denoiseToolOutput, limitToolResults, PER_RESULT_TOOL_TEXT_BUDGET, TOOL_TEXT_BUDGET } from '../src/tool-output.js';
 
 test('saved results preserve the complete returned text and stay within the ~5,000 per-result limit', async t => {
   const text = 'first line\r\n' + '"\\🙂'.repeat(20000) + '\n[Earlier truncation: original log is elsewhere.]';
@@ -63,4 +63,33 @@ test('an aborted exchange does not save tool output', async () => {
   await assert.rejects(limitToolResults([{ role: 'toolResult', content: [{ type: 'text', text: 'x'.repeat(50000) }] }], {
     signal: controller.signal, save: () => { throw new Error('Must not save'); }
   }), { name: 'AbortError' });
+});
+
+test('bash output is denoised (ANSI, progress bars, duplicate lines) before budgeting while read output stays verbatim', async () => {
+  const noisy = [
+    '\x1b[32mPASS\x1b[0m suite',
+    'Loading 10%\rLoading 50%\rLoading 100%',
+    ...Array(200).fill('Warning: deprecated API call'),
+    'Done.'
+  ].join('\n');
+
+  const denoised = denoiseToolOutput(noisy);
+  assert.doesNotMatch(denoised, /\x1b\[/);
+  assert.match(denoised, /PASS suite/);
+  assert.match(denoised, /Loading 100%/);
+  assert.doesNotMatch(denoised, /Loading 10%/);
+  assert.match(denoised, /\[\.\.\. repeated 199 more times \.\.\.\]/);
+
+  // Denoising shrinks noisy bash output below the 5K cap so no temp file save or follow-up read turn is needed!
+  let saved = 0;
+  const bashResult = [{ role: 'toolResult', toolCallId: 'b1', toolName: 'bash', isError: false, content: [{ type: 'text', text: noisy }] }];
+  const limitedBash = await limitToolResults(bashResult, { save: async () => { saved++; return 'C:/temp/unused.txt'; } });
+  assert.equal(saved, 0);
+  assert.equal(limitedBash[0].content[0].text, denoised);
+
+  // Read results must NEVER be denoised so exact-match edit targets stay intact.
+  const readSource = 'const a = "\\x1b[32m";\n' + 'same line\n'.repeat(10);
+  const readResult = [{ role: 'toolResult', toolCallId: 'r1', toolName: 'read', isError: false, content: [{ type: 'text', text: readSource }] }];
+  const limitedRead = await limitToolResults(readResult, { save: async () => { throw new Error('Must not save'); } });
+  assert.equal(limitedRead[0].content[0].text, readSource);
 });

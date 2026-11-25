@@ -373,6 +373,8 @@ export class SharedBrowserClient {
               if (event.code) err.code = event.code;
               if (event.beforeSend !== undefined) err.beforeSend = event.beforeSend;
               if (event.retryableInFreshChat !== undefined) err.retryableInFreshChat = event.retryableInFreshChat;
+              if (event.limitNotice !== undefined) err.limitNotice = event.limitNotice;
+              if (event.effectivePref !== undefined) err.effectivePref = event.effectivePref;
               streamError = err;
             }
           }

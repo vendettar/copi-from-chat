@@ -29,6 +29,7 @@ async function fixture(t, config = {}) {
     <div id="submenu" role="menu" style="min-width:10px;min-height:10px" hidden></div>
     <div id="m365-chat-editor-target-element" contenteditable="true" data-lexical-editor="true"></div>
     <button id="send">Send</button><button id="stop" data-testid="stop-button" hidden>Stop</button>
+    <div id="alert" role="alert" hidden></div>
     <main id="replies"></main>
     <script>
       const config = ${JSON.stringify({ ...config, items, initialIndex })};
@@ -135,6 +136,12 @@ async function fixture(t, config = {}) {
       composer.oninput = onInput;
       document.getElementById('send').onclick = () => {
         window.sendClicks++;
+        if (config.blockSendAlert) {
+          const alertEl = document.getElementById('alert');
+          alertEl.textContent = config.blockSendAlert;
+          alertEl.hidden = false;
+          return;
+        }
         if (config.ignoreSendCount && window.sendClicks <= config.ignoreSendCount) return;
         if (config.ambiguousSend) {
           composer.textContent = composer.textContent + ' [mutated]';
@@ -142,6 +149,12 @@ async function fixture(t, config = {}) {
         }
         window.sent.push({ text: composer.innerText, selected: selectedLabel });
         composer.textContent = '';
+        if (config.alertAfterSend) {
+          const alertEl = document.getElementById('alert');
+          alertEl.textContent = config.alertAfterSend;
+          alertEl.hidden = false;
+          return;
+        }
         const stop = document.getElementById('stop');
         stop.hidden = false;
         const reply = document.createElement('article');
@@ -427,4 +440,29 @@ test('listModels reads live Chinese options and setModelPreference switches auto
   const idx2 = await browser.setModelPreference(2);
   assert.equal(idx2.applied, true);
   assert.equal(idx2.result.label, '深度思考');
+});
+
+test('detects M365 [role="alert"] daily-limit banners both after Send and when Send is blocked', async t => {
+  // Case 1: M365 clears editor after Send, emits NO assistant bubble, and shows a [role="alert"] banner.
+  const b1 = await fixture(t, {
+    initialIndex: 2,
+    alertAfterSend: 'You have reached your daily limit for Think deeper. Try again tomorrow.'
+  });
+  if (!b1) return;
+  const reply = await b1.ask('Run with think.', { fresh: true });
+  assert.equal(reply.completed, true);
+  assert.equal(reply.fromAlertBanner, true);
+  assert.match(reply.alertText, /daily limit for Think deeper/i);
+
+  // Case 2: M365 blocks Send and displays a Chinese [role="alert"] daily-limit toast.
+  const b2 = await fixture(t, {
+    initialIndex: 2,
+    sendConfirmTimeoutMs: 250,
+    sendConfirmPollMs: 40,
+    blockSendAlert: '您已达到今日深度思考使用上限，请明天再试。'
+  });
+  await assert.rejects(
+    b2.ask('Blocked by limit toast.', { fresh: true }),
+    error => error.code === 'COPILOT_WEB_LIMIT' && error.beforeSend === true && error.limitNotice?.kind === 'daily_limit'
+  );
 });

@@ -434,9 +434,8 @@ export async function createRuntime({
       control: providerControl
     }));
     const appendSystemPrompt = [
-      'Use Bash syntax and forward-slash paths on Windows. ' +
-      'Use grep and find to search project files; use bash for commands, builds and tests. ' +
-      'Minimize round-trips: batch independent find/grep/read calls together in one turn, read whole small/medium files (<300 lines) in one call, combine edits per file, and chain verification commands with &&.'
+      'Use Bash syntax and forward-slash paths on Windows. Use grep and find for project search; use bash for commands, builds, and tests. ' +
+      'Calls in one tool_calls turn run sequentially in order, so batch reads/searches together and chain dependent edits with bash verification (e.g. [edit, bash("npm test")]) in a single turn.'
     ];
     if (projectInstructions.promptSection) {
       appendSystemPrompt.push(projectInstructions.promptSection);
@@ -459,6 +458,11 @@ export async function createRuntime({
       tools: readonly ? ['read', 'grep', 'find'] : ['read', 'bash', 'edit', 'write', 'grep', 'find'],
       customTools: createSearchTools(cwd, { allowNonGitFallback: enableFallback })
     });
+    // Run tool calls sequentially in array order so Copilot can safely emit [edit, bash("npm test")]
+    // in a single web turn without race conditions (saves ~1 full web quota turn per code edit).
+    if (created.session?.agent) {
+      created.session.agent.toolExecution = 'sequential';
+    }
     sessionRef = created.session;
 
     if (copiPaths) {
@@ -489,6 +493,7 @@ export async function createRuntime({
 
     return {
       ...created,
+      providerControl,
       services, diagnostics: services.diagnostics
     };
   } catch (error) {
@@ -532,22 +537,27 @@ export async function runAgent({
 
   let runtime;
   let mode;
+  let activeProviderControl = null;
   const interrupt = () => { process.exitCode = 130; void runtime?.session.abort(); };
 
   try {
-    const factory = options => createRuntime({
-      ...options,
-      browser,
-      copiPaths,
-      profile,
-      modelController,
-      prewarmBrowser: Boolean(interactive),
-      autoApproveRisky: effectiveAutoApprove,
-      readonly,
-      preloadWorkspace,
-      bellState,
-      sharedBrowserOptions
-    });
+    const factory = async options => {
+      const created = await createRuntime({
+        ...options,
+        browser,
+        copiPaths,
+        profile,
+        modelController,
+        prewarmBrowser: Boolean(interactive),
+        autoApproveRisky: effectiveAutoApprove,
+        readonly,
+        preloadWorkspace,
+        bellState,
+        sharedBrowserOptions
+      });
+      activeProviderControl = created.providerControl;
+      return created;
+    };
     runtime = await createAgentSessionRuntime(factory, {
       cwd: sessionManager.getCwd(),
       agentDir,
@@ -556,9 +566,12 @@ export async function runAgent({
     });
 
     if (interactive) {
-      const initialPrompt = prompt ? (await expandFileMentions(prompt, runtime.cwd)).text : undefined;
+      const expanded = prompt ? await expandFileMentions(prompt, runtime.cwd) : null;
+      if (expanded?.loadedEntries?.length) {
+        activeProviderControl?.notePreloadedFiles?.(expanded.loadedEntries);
+      }
       mode = new CopiInteractiveMode(runtime, {
-        initialMessage: initialPrompt,
+        initialMessage: expanded?.text,
         modelController
       });
       await mode.run();
@@ -574,8 +587,11 @@ export async function runAgent({
       });
       process.on('SIGINT', interrupt);
       process.on('SIGTERM', interrupt);
-      const expandedPrompt = (await expandFileMentions(prompt, runtime.cwd)).text;
-      await session.prompt(expandedPrompt);
+      const expanded = await expandFileMentions(prompt, runtime.cwd);
+      if (expanded.loadedEntries?.length) {
+        activeProviderControl?.notePreloadedFiles?.(expanded.loadedEntries);
+      }
+      await session.prompt(expanded.text);
       const last = session.state.messages.findLast(message => message.role === 'assistant');
       if (process.exitCode !== 130 && (!last || last.stopReason !== 'stop')) {
         throw new Error(last?.errorMessage ?? 'The task did not complete.');

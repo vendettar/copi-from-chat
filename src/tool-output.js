@@ -7,7 +7,54 @@ import { join } from 'node:path';
 // User instructions are never shortened; full tool output is always saved locally when shortened.
 export const TOOL_TEXT_BUDGET = 10000;
 export const PER_RESULT_TOOL_TEXT_BUDGET = 5000;
+const MIN_REPEAT_FOLD = 4;
 const size = content => JSON.stringify(content).length;
+
+// Strip ANSI CSI/OSC/single-char escapes, collapse carriage-return progress bar frames,
+// and fold long runs of identical consecutive terminal lines to maximize information density.
+const ANSI_ESCAPE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])/g;
+
+export function denoiseToolOutput(text) {
+  if (typeof text !== 'string' || !text) return text;
+  let cleaned = text.includes('\x1b') ? text.replace(ANSI_ESCAPE, '') : text;
+
+  const hadCR = cleaned.includes('\r');
+  if (hadCR) {
+    cleaned = cleaned
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map(line => {
+        if (!line.includes('\r')) return line;
+        // Keep the last non-empty carriage-return frame (what a terminal actually displays).
+        const frames = line.split('\r');
+        for (let i = frames.length - 1; i >= 0; i--) {
+          if (frames[i].length > 0) return frames[i];
+        }
+        return '';
+      })
+      .join('\n');
+  }
+
+  const lines = cleaned.split('\n');
+  if (lines.length < MIN_REPEAT_FOLD) return cleaned;
+
+  const folded = [];
+  let changed = cleaned !== text;
+  for (let i = 0; i < lines.length; ) {
+    const line = lines[i];
+    let j = i + 1;
+    while (j < lines.length && lines[j] === line) j++;
+    const count = j - i;
+    if (count >= MIN_REPEAT_FOLD && line.trim().length > 0) {
+      folded.push(line, `[... repeated ${count - 1} more times ...]`);
+      changed = true;
+    } else {
+      for (let k = i; k < j; k++) folded.push(lines[k]);
+    }
+    i = j;
+  }
+  return changed ? folded.join('\n') : text;
+}
 
 async function saveOutput(text, signal) {
   const path = join(tmpdir(), `copi-output-${randomUUID()}.txt`);
@@ -32,34 +79,61 @@ function preview(text, path, budget) {
   return best;
 }
 
+function rawTextOf(content) {
+  return typeof content === 'string' ? content : content.map(block => block.text).join('\n\n');
+}
+
 export async function limitToolResults(messages, {
   signal,
   save = saveOutput,
   batchBudget = TOOL_TEXT_BUDGET,
-  perResultBudget = PER_RESULT_TOOL_TEXT_BUDGET
+  perResultBudget = PER_RESULT_TOOL_TEXT_BUDGET,
+  denoise = true
 } = {}) {
   signal?.throwIfAborted();
-  const results = messages.map((message, index) => ({ message, index }))
-    .filter(({ message }) => message.role === 'toolResult');
-  const totalSize = results.reduce((sum, { message }) => sum + size(message.content), 0);
-  const anyOversized = results.some(({ message }) => size(message.content) > perResultBudget);
-  if (totalSize <= batchBudget && !anyOversized) return messages;
+  let denoisedAny = false;
+  // Denoise bash terminal output (ANSI, \r progress frames, spammy repeats) BEFORE budgeting.
+  // Never alter read/grep/find output so exact-match edit targets stay 100% verbatim.
+  const entries = messages.map((message, index) => {
+    if (message.role !== 'toolResult') return null;
+    const rawText = rawTextOf(message.content);
+    const shouldDenoise = denoise && message.toolName === 'bash';
+    const workingText = shouldDenoise ? denoiseToolOutput(rawText) : rawText;
+    const denoised = workingText !== rawText;
+    if (denoised) denoisedAny = true;
+    const workingContent = denoised ? [{ type: 'text', text: workingText }] : message.content;
+    return { message, index, rawText, workingText, workingContent, denoised };
+  }).filter(Boolean);
+
+  const totalSize = entries.reduce((sum, item) => sum + size(item.workingContent), 0);
+  const anyOversized = entries.some(item => size(item.workingContent) > perResultBudget);
+  if (totalSize <= batchBudget && !anyOversized) {
+    if (!denoisedAny) return messages;
+    const next = [...messages];
+    for (const item of entries) {
+      if (item.denoised) next[item.index] = { ...item.message, content: item.workingContent };
+    }
+    return next;
+  }
 
   const limited = [...messages];
-  let remaining = batchBudget, count = results.length;
+  for (const item of entries) {
+    if (item.denoised) limited[item.index] = { ...item.message, content: item.workingContent };
+  }
+  let remaining = batchBudget, count = entries.length;
   // Small results stay whole; large results share the remaining batch budget and obey the per-result cap.
-  for (const { message, index } of results.sort((a, b) => size(a.message.content) - size(b.message.content))) {
+  for (const item of entries.sort((a, b) => size(a.workingContent) - size(b.workingContent))) {
     signal?.throwIfAborted();
     const fairShare = Math.max(512, Math.floor(remaining / count--));
     const share = Math.min(perResultBudget, fairShare);
-    let content = message.content;
+    let content = item.workingContent;
     if (size(content) > share) {
-      const text = typeof content === 'string' ? content : content.map(block => block.text).join('\n\n');
-      const path = await save(text, signal);
+      // Always save the original unmodified raw output to disk for full inspection.
+      const path = await save(item.rawText, signal);
       signal?.throwIfAborted();
-      content = preview(text, path, share);
+      content = preview(item.workingText, path, share);
       // Change only the transport copy. Keep tool IDs, errors and the local transcript intact.
-      limited[index] = { ...message, content };
+      limited[item.index] = { ...item.message, content };
     }
     remaining -= size(content);
   }

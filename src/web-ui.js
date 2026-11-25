@@ -270,12 +270,13 @@ export function createWebUI(browser, {
         });
       });
 
-      // Expand @path/to/file mentions locally (0 extra web turns!).
+      // Expand @path/to/file mentions AND plain workspace file paths locally (0 extra web turns!).
       pi.on('input', async (event, ctx) => {
-        if (!event?.text || !event.text.includes('@')) return { action: 'continue' };
+        if (!event?.text || event.text.trimStart().startsWith('/')) return { action: 'continue' };
         const expanded = await expandFileMentions(event.text, ctx.cwd);
         if (!expanded.loadedFiles.length) return { action: 'continue' };
-        ctx.ui?.notify(`Preloaded @file context: ${expanded.loadedFiles.join(', ')}`, 'info');
+        providerControl?.notePreloadedFiles?.(expanded.loadedEntries);
+        ctx.ui?.notify(`Preloaded file context: ${expanded.loadedFiles.join(', ')}`, 'info');
         return { action: 'transform', text: expanded.text };
       });
 
@@ -444,6 +445,7 @@ export function createWebUI(browser, {
           modelController?.setOneShotPreference?.({ kind: 'preset', name: 'think' });
           ctx.ui.notify('Using Think deeper for this turn only...', 'info');
           const expanded = await expandFileMentions(prompt, ctx.cwd);
+          if (expanded.loadedEntries?.length) providerControl?.notePreloadedFiles?.(expanded.loadedEntries);
           pi.sendUserMessage(expanded.text);
         }
       });
@@ -624,10 +626,13 @@ export function createWebUI(browser, {
             ? `${messageCount} messages (proactive compaction active on resume/reconnect)`
             : `${messageCount}/${PROACTIVE_COMPACTION_THRESHOLD} messages before proactive compaction`;
           const hostDetail = liveStatus?.port ? ` (127.0.0.1:${liveStatus.port}, PID ${liveStatus.hostPid})` : '';
+          const tabDetail = pState?.webTurnsInTab
+            ? ` · web tab: ${pState.webTurnsInTab} turns (~${(pState.webCharsInTab / 1000).toFixed(1)}K chars${pState.cachedReads ? `, ${pState.cachedReads} cached reads` : ''})`
+            : '';
           ctx.ui.notify([
             `Workspace: ${ctx.cwd}`,
             `Session: ${sessionId ?? '(in-memory)'}${sessionName ? ` ("${sessionName}")` : ''}`,
-            `Context: ${compactionNote}${pState?.webTurnsInTab ? ` · web turns in tab: ${pState.webTurnsInTab}` : ''}`,
+            `Context: ${compactionNote}${tabDetail}`,
             `Quota: ${formatQuotaShort(quota)} (${quota.date})`,
             `Model: ${modelPref}${activeModel ? ` (active: ${activeModel})` : ''}`,
             `Edge: ${liveStatus?.state ?? edgeState}${hostDetail}${pState?.needsNewChat ? ' · web needs /reconnect or /new' : ''}`,
@@ -745,6 +750,7 @@ export function createWebUI(browser, {
           handler: async (args, ctx) => {
             const rendered = await renderPromptTemplate(template, { args: args ?? '', cwd: ctx.cwd });
             const expanded = await expandFileMentions(rendered, ctx.cwd);
+            if (expanded.loadedEntries?.length) providerControl?.notePreloadedFiles?.(expanded.loadedEntries);
             pi.sendUserMessage(expanded.text);
           }
         });

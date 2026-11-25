@@ -373,8 +373,9 @@ test('copi CLI --help, --version, doctor, host status, and sessions subcommands 
   assert.match(helpOut, /\/undo/);
   assert.match(helpOut, /\/export/);
 
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   const { stdout: versionOut } = await exec(process.execPath, ['src/agent.js', '--version']);
-  assert.equal(versionOut.trim(), '0.1.0');
+  assert.equal(versionOut.trim(), pkg.version);
 
   const tmpHome = await mkdtemp(join(tmpdir(), 'copi-cli-subcmd-'));
   try {

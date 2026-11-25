@@ -7,6 +7,7 @@ import {
   DEFAULT_MODEL_PREFERENCE, modelPreferenceKey, parseModelPreference,
   resolveCandidateIndices, resolveEffectivePreference
 } from './model-preference.js';
+import { detectWebLimitNotice } from './quota.js';
 
 export const CHAT_URL = 'https://m365.cloud.microsoft/chat';
 const INPUT = '#m365-chat-editor-target-element:is(input, textarea, [contenteditable="true"]):visible, '
@@ -17,7 +18,23 @@ const DEFAULT_SEND_CONFIRM_TIMEOUT = 5000;
 const DEFAULT_SEND_CONFIRM_POLL = 150;
 const DEFAULT_REPLY_TIMEOUT = 600000;
 const RESPONSES = '[data-testid="markdown-reply"]:visible, [data-message-author-role="assistant"]:visible, [data-author="assistant"]:visible';
+const ALERT_BANNERS = '[role="alert"]:visible, [role="status"]:visible, .fui-MessageBar:visible, .fui-Toast:visible, '
+  + '[data-testid*="limit" i]:visible, [data-testid*="quota" i]:visible, [data-testid*="banner" i]:visible, [data-testid*="error" i]:visible';
 const normalize = text => text.replace(/\r\n?/g, '\n').replace(/^[\s\u200B\u200C\uFEFF]+|[\s\u200B\u200C\uFEFF]+$/g, '');
+
+async function readPageAlertNotice(page) {
+  try {
+    const texts = await page.locator(ALERT_BANNERS).evaluateAll(elements => elements
+      .filter(el => !el.closest('[data-message-author-role="assistant"], [data-author="assistant"], [data-testid="markdown-reply"]'))
+      .map(el => (el.innerText ?? '').replace(/\s+/g, ' ').trim())
+      .filter(text => text.length > 0 && text.length <= 600));
+    for (const text of texts) {
+      const notice = detectWebLimitNotice(text);
+      if (notice.limited) return notice;
+    }
+  } catch { /* best-effort alert inspection */ }
+  return { limited: false, kind: null };
+}
 
 function tagError(error, props) {
   if (error && typeof error === 'object') Object.assign(error, props);
@@ -850,6 +867,14 @@ export class CopilotTab {
         }
 
         if (!sendConfirmed) {
+          // Check whether a visible M365 alert/toast banner blocked Send (e.g., Think deeper daily cap).
+          const alertNotice = await readPageAlertNotice(page);
+          if (alertNotice.limited) {
+            throw tagError(
+              new Error(`Microsoft 365 Copilot displayed a usage limit banner (${alertNotice.excerpt}).`),
+              { code: 'COPILOT_WEB_LIMIT', beforeSend: true, limitNotice: alertNotice, effectivePref }
+            );
+          }
           // Verified draft remained completely unchanged after initial Send + single retry;
           // no editor clear, no generation, and no reply DOM change occurred.
           throw tagError(
@@ -867,7 +892,9 @@ export class CopilotTab {
 
       let sawGenerating = false, reportedThinking = false, lastText = '';
       let candidate = '', candidateSince = 0;
-      const deadline = Date.now() + this.replyTimeoutMs;
+      const waitStarted = Date.now();
+      let lastAlertCheck = 0;
+      const deadline = waitStarted + this.replyTimeoutMs;
       while (Date.now() < deadline) {
         signal?.throwIfAborted();
         const reply = await replies.evaluateAll(readReply, previous);
@@ -882,6 +909,21 @@ export class CopilotTab {
             reportedThinking = true;
           }
         }
+        // Detect page-level [role="alert"] / toast limit banners when M365 refuses to emit a reply bubble.
+        if (!current && !generating && Date.now() - waitStarted >= 1200 && Date.now() - lastAlertCheck >= 1000) {
+          lastAlertCheck = Date.now();
+          const alertNotice = await readPageAlertNotice(page);
+          if (alertNotice.limited) {
+            return {
+              text: alertNotice.excerpt,
+              protocolText: alertNotice.excerpt,
+              alertText: alertNotice.excerpt,
+              codeBlocks: [],
+              completed: true,
+              fromAlertBanner: true
+            };
+          }
+        }
         if (current && reply.text !== lastText) {
           await onSnapshot(reply);
           lastText = reply.text;
@@ -892,7 +934,18 @@ export class CopilotTab {
           else if (Date.now() - candidateSince >= 1500) {
             signal?.throwIfAborted();
             this.lastReply = { page, signature: replyFingerprint(reply) };
-            return { text: reply.text, protocolText: reply.protocolText, codeBlocks: reply.codeBlocks, completed: true };
+            let alertText;
+            if (!reply.text.includes('<<<COPILOT_REPLY_START:') && reply.text.length < 1200) {
+              const alertNotice = await readPageAlertNotice(page);
+              if (alertNotice.limited) alertText = alertNotice.excerpt;
+            }
+            return {
+              text: reply.text,
+              protocolText: reply.protocolText,
+              codeBlocks: reply.codeBlocks,
+              completed: true,
+              ...(alertText ? { alertText } : {})
+            };
           }
         } else { candidate = ''; candidateSince = 0; }
         await delay(300, undefined, { signal });
