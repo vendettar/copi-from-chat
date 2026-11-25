@@ -20,7 +20,7 @@ async function listJs(dir) {
 
 async function main() {
   const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
-  if (pkg.private === true) throw new Error('package.json must not set private: true for portable tgz packaging.');
+  if (pkg.private !== true) throw new Error('package.json must set private: true to prevent accidental npm publish.');
   if (pkg.name !== 'copi-from-chat') throw new Error(`Expected package name "copi-from-chat", got "${pkg.name}".`);
   if (!pkg.bin?.copi) throw new Error('package.json is missing bin.copi.');
   await access(join(ROOT, pkg.bin.copi));
@@ -28,12 +28,6 @@ async function main() {
   const agentSource = await readFile(join(ROOT, pkg.bin.copi), 'utf8');
   if (!agentSource.startsWith('#!/usr/bin/env node')) {
     throw new Error(`${pkg.bin.copi} must start with #!/usr/bin/env node.`);
-  }
-
-  const depNames = Object.keys(pkg.dependencies ?? {}).sort();
-  const bundled = [...(pkg.bundleDependencies ?? pkg.bundledDependencies ?? [])].sort();
-  if (JSON.stringify(depNames) !== JSON.stringify(bundled)) {
-    throw new Error('bundleDependencies must match dependencies so npm pack produces a portable tgz.');
   }
 
   for (const doc of ['README.md', 'ROADMAP.md', 'UPGRADE-SUMMARY.md']) {

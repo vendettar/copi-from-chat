@@ -30,8 +30,8 @@ Staged improvements and acceptance criteria for `copi-from-chat`.
 - Wait up to 5 seconds after clicking Send for editor clear, generation start, or reply DOM change; retry Send exactly once only if the verified draft stays completely unchanged; never click again on ambiguous DOM changes.
 - Retry proven pre-Send failures (such as lost web context or unchanged draft after retry) in a fresh web conversation; block automatic replay on uncertain post-Send failures.
 - Record lifecycle events in `~/.copi/activity.jsonl` and tool checkpoints in `~/.copi/checkpoints`.
-- Package `copi-from-chat` via `npm pack` with bundled dependencies for offline global installation on Windows.
-- **Acceptance criteria**: Send retry triggers at most once when draft is unchanged, never retries on ambiguous DOM change or post-Send failure, and `npm install -g ./copi-from-chat-*.tgz` installs `copi` offline.
+- Package `copi-from-chat` via `npm pack` (`private: true`) for portable `.tgz` installation on Windows without publishing to npm.
+- **Acceptance criteria**: Send retry triggers at most once when draft is unchanged, never retries on ambiguous DOM change or post-Send failure, and `npm install -g ./copi-from-chat-*.tgz` installs `copi` cleanly.
 
 ## Stage 5 — Future Hardening (Planned)
 

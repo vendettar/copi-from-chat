@@ -4,8 +4,7 @@ Summary of the transformation from `copilot-from-chat-poc` (`copilot`) to standa
 
 ## Package & CLI
 
-- Renamed package from `copilot-from-chat-poc` (`private: true`, bin `copilot`) to `copi-from-chat` (installable via `npm pack` `.tgz`, bin `copi`).
-- Bundled all runtime dependencies in `bundleDependencies` so `npm pack` creates a self-contained portable `.tgz` that installs cleanly on offline/restricted Windows machines via `npm install -g --ignore-scripts ./copi-from-chat-0.0.7.tgz`.
+- Renamed package from `copilot-from-chat-poc` (bin `copilot`) to `copi-from-chat` (bin `copi`), keeping `private: true` to prevent accidental `npm publish` while packaging cleanly via `npm pack` (`npm install -g ./copi-from-chat-0.0.7.tgz`).
 - Lowered `engines.node` to `>=20.0.0` and added `npm run check` (`src/check.js`).
 - Added CLI flags `-c/--continue`, `-s/--session <id>`, `--profile <name>`, and `-v/--version`, plus Git Bash POSIX path normalization (`/c/...` -> `C:/...`) and extended Git Bash auto-detection on Windows.
 

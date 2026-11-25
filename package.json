@@ -1,6 +1,7 @@
 {
   "name": "copi-from-chat",
   "version": "0.0.7",
+  "private": true,
   "type": "module",
   "description": "Windows coding-agent CLI using Microsoft 365 Copilot in Edge as the model transport and Pi as the local agent runtime.",
   "bin": {
@@ -27,11 +28,5 @@
     "@earendil-works/pi-coding-agent": "1.5.0",
     "@earendil-works/pi-tui": "1.5.0",
     "playwright-core": "1.63.0"
-  },
-  "bundleDependencies": [
-    "@earendil-works/pi-ai",
-    "@earendil-works/pi-coding-agent",
-    "@earendil-works/pi-tui",
-    "playwright-core"
-  ]
+  }
 }
