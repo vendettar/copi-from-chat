@@ -604,7 +604,8 @@ export function createCopilotProvider(browser, {
             : (effectivePref?.name ?? 'auto');
 
           onStatus(`Sending to Copilot (${tierLabel})...`);
-          let previewed = false;
+          let lastReportedBucket = -1;
+          let lastReportedPhase = '';
           try {
             const reply = await browser.ask(prompt, {
               signal: options.signal,
@@ -615,7 +616,20 @@ export function createCopilotProvider(browser, {
               turnContext,
               onStatus,
               onSnapshot: async snapshot => {
-                if (!previewed) { onStatus('Receiving Copilot reply...'); previewed = true; }
+                const liveText = snapshot?.text ?? '';
+                const len = liveText.length;
+                const phase = /"type"\s*:\s*"tool_calls"/.test(liveText)
+                  ? 'Planning tool calls'
+                  : /"type"\s*:\s*"final"/.test(liveText)
+                    ? 'Drafting answer'
+                    : 'Receiving Copilot reply';
+                const bucket = len < 200 ? 0 : Math.floor(len / 300);
+                if (phase !== lastReportedPhase || bucket !== lastReportedBucket) {
+                  lastReportedPhase = phase;
+                  lastReportedBucket = bucket;
+                  const sizeNote = len >= 200 ? `, ${(len / 1000).toFixed(1)}K chars` : '';
+                  onStatus(`${phase} (${tierLabel}${sizeNote})...`);
+                }
                 await options.onProviderStreamEvent?.({ type: 'dom_snapshot', ...snapshot }, model);
               }
             });

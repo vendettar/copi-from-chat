@@ -1,11 +1,15 @@
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { Container, SelectList, Spacer, Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { PROACTIVE_COMPACTION_THRESHOLD } from './compaction.js';
-import { cleanupLocalArtifacts, copyToClipboard, extractLastCodeBlock, getGitDiffSummary } from './commands.js';
+import {
+  appendProjectRule, cleanupLocalArtifacts, copyToClipboard, extractLastCodeBlock,
+  formatRecentActivity, getGitDiffSummary, readProjectRules, runLocalCommand
+} from './commands.js';
 import { runDoctor } from './doctor.js';
 import { formatModelPreference } from './model-preference.js';
+import { normalizeCliPath } from './paths.js';
 import { buildEditFailureHint, runPostEditSyntaxCheck } from './post-edit-check.js';
 import { expandFileMentions } from './precontext.js';
 import { renderPromptTemplate } from './prompts.js';
@@ -117,6 +121,8 @@ export function createWebUI(browser, {
   providerControl,
   loadedInstructionFiles = [],
   promptTemplates = [],
+  allowedDirs = [],
+  shellPath,
   autoApproveRisky = false,
   readonlyState = { enabled: false },
   bellState = { enabled: true, minMs: 5000 },
@@ -129,9 +135,25 @@ export function createWebUI(browser, {
   let ui, workingMessage, footerTui;
   let edgeState = browser?.mode === 'shared' ? 'connecting' : 'idle';
   let turnStartedAt = 0;
+  let pendingRunContext = null;
+  const sessionAllowedDirs = [...new Set(
+    (Array.isArray(allowedDirs) ? allowedDirs : [])
+      .filter(d => typeof d === 'string' && d.trim())
+      .map(d => resolve(cwd, normalizeCliPath(d)))
+  )];
   const toolStartTimes = new Map();
   const toolHistory = createToolHistoryStore();
   const undoManager = createUndoManager(cwd);
+
+  const consumePendingRunContext = text => {
+    if (!pendingRunContext) return { text, attachedRun: null };
+    const attachedRun = pendingRunContext;
+    pendingRunContext = null;
+    return {
+      text: `${text}\n\n${attachedRun.promptBlock}`,
+      attachedRun
+    };
+  };
 
   const requestFooterRender = () => {
     try { footerTui?.requestRender(); } catch { /* ignore */ }
@@ -151,7 +173,7 @@ export function createWebUI(browser, {
   const onStatus = message => {
     if (typeof message === 'string') {
       if (/sign in to microsoft 365/i.test(message)) setEdgeState('sign-in required');
-      else if (/sending to copilot|receiving copilot|waiting for copilot|thinking deeply/i.test(message)) setEdgeState('ready');
+      else if (/sending to copilot|receiving copilot|waiting for copilot|thinking deeply|planning tool calls|drafting answer/i.test(message)) setEdgeState('ready');
     }
     if (!ui || message === workingMessage) return;
     workingMessage = message;
@@ -242,7 +264,7 @@ export function createWebUI(browser, {
           invalidate() {},
           render: width => [
             theme.fg('accent', 'Copi · Copilot from Chat'),
-            theme.fg('dim', 'Enter send · Esc stop · Ctrl+O details · /model · /think · /quota · /undo · /inspect · /resume · /quit')
+            theme.fg('dim', 'Enter send · Esc stop · Ctrl+O details · /model · /think · /run · /allow-dir · /quota · /undo · /resume · /quit')
           ].map(line => truncateToWidth(line, width))
         }));
         ui.setFooter((tui, theme, data) => {
@@ -274,14 +296,18 @@ export function createWebUI(browser, {
         });
       });
 
-      // Expand @path/to/file mentions AND plain workspace file paths locally (0 extra web turns!).
+      // Expand @path/to/file mentions, plain workspace/allowedDir paths, and any pending /run output locally (0 extra web turns!).
       pi.on('input', async (event, ctx) => {
         if (!event?.text || event.text.trimStart().startsWith('/')) return { action: 'continue' };
-        const expanded = await expandFileMentions(event.text, ctx.cwd);
-        if (!expanded.loadedFiles.length) return { action: 'continue' };
-        providerControl?.notePreloadedFiles?.(expanded.loadedEntries);
-        ctx.ui?.notify(`Preloaded file context: ${expanded.loadedFiles.join(', ')}`, 'info');
-        return { action: 'transform', text: expanded.text };
+        const expanded = await expandFileMentions(event.text, ctx.cwd, { allowedDirs: sessionAllowedDirs });
+        const withRun = consumePendingRunContext(expanded.text);
+        if (!expanded.loadedFiles.length && !withRun.attachedRun) return { action: 'continue' };
+        if (expanded.loadedEntries?.length) providerControl?.notePreloadedFiles?.(expanded.loadedEntries);
+        const notes = [];
+        if (expanded.loadedFiles.length) notes.push(`files: ${expanded.loadedFiles.join(', ')}`);
+        if (withRun.attachedRun) notes.push(`/run output: ${withRun.attachedRun.command} (exit ${withRun.attachedRun.exitCode})`);
+        ctx.ui?.notify(`Preloaded locally (${notes.join(' · ')})`, 'info');
+        return { action: 'transform', text: withRun.text };
       });
 
       pi.on('session_before_switch', async (event, ctx) => {
@@ -304,7 +330,7 @@ export function createWebUI(browser, {
         }
 
         if (!autoApproveRisky) {
-          const risk = assessToolRisk({ toolName: event.toolName, input: event.input, cwd: ctx.cwd });
+          const risk = assessToolRisk({ toolName: event.toolName, input: event.input, cwd: ctx.cwd, allowedDirs: sessionAllowedDirs });
           if (risk.risky) {
             if (ctx.hasUI) {
               const allowed = await ctx.ui.confirm(risk.title, risk.detail);
@@ -462,9 +488,10 @@ export function createWebUI(browser, {
           }
           modelController?.setOneShotPreference?.({ kind: 'preset', name: 'think' });
           ctx.ui.notify('Using Think deeper for this turn only...', 'info');
-          const expanded = await expandFileMentions(prompt, ctx.cwd);
+          const expanded = await expandFileMentions(prompt, ctx.cwd, { allowedDirs: sessionAllowedDirs });
           if (expanded.loadedEntries?.length) providerControl?.notePreloadedFiles?.(expanded.loadedEntries);
-          pi.sendUserMessage(expanded.text);
+          const withRun = consumePendingRunContext(expanded.text);
+          pi.sendUserMessage(withRun.text);
         }
       });
 
@@ -481,8 +508,94 @@ export function createWebUI(browser, {
             `  auto:  ${record.counts.auto}`,
             ...(record.counts.index ? [`  index: ${record.counts.index}`] : []),
             `Current model preference: ${pref}`,
-            'Quota tips: use /model smart (or /model quick + /think <prompt>), reference files with @path/to/file, and use /diff /undo /inspect locally (0 quota).'
+            'Quota tips: use /model quick + /think <prompt>, run local checks via /run <cmd> (auto-attaches to next prompt), use /allow-dir <dir> for multi-dir preloading, and use /diff /undo /inspect locally (0 quota).'
           ].join('\n'), 'info');
+        }
+      });
+
+      pi.registerCommand('run', {
+        description: 'Run a local shell command at 0 web quota and auto-attach its output once to your next prompt',
+        handler: async (args, ctx) => {
+          const raw = (args ?? '').trim();
+          if (!raw) {
+            const pendingNote = pendingRunContext
+              ? `Pending /run output ready to attach: "${pendingRunContext.command}" (exit ${pendingRunContext.exitCode}). Use "/run --clear" to drop it.`
+              : 'Usage: /run <command> (runs locally at 0 web quota and attaches output to your next message).';
+            ctx.ui.notify(pendingNote, 'info');
+            return;
+          }
+          if (raw === '--clear' || raw === 'clear') {
+            pendingRunContext = null;
+            ctx.ui.notify('Cleared pending /run output.', 'info');
+            return;
+          }
+          ctx.ui.notify(`Running locally (0 quota): ${raw}`, 'info');
+          try {
+            const res = await runLocalCommand(raw, { cwd: ctx.cwd, shellPath });
+            pendingRunContext = res;
+            ctx.ui.notify([
+              `$ ${res.command}  [exit ${res.exitCode}]`,
+              res.output,
+              '',
+              'Saved locally: your next message (or /fix) will automatically include this output (0 extra bash turn; "/run --clear" to discard).'
+            ].join('\n'), res.exitCode === 0 ? 'info' : 'warning');
+          } catch (error) {
+            ctx.ui.notify(`Local /run failed: ${error.message}`, 'error');
+          }
+        }
+      });
+
+      pi.registerCommand('allow-dir', {
+        description: 'Authorize an extra directory for edits and zero-turn file preloading (usage: /allow-dir <dir|clear>)',
+        handler: async (args, ctx) => {
+          const raw = (args ?? '').trim();
+          if (!raw || raw === 'list') {
+            ctx.ui.notify(sessionAllowedDirs.length
+              ? `Authorized extra directories:\n${sessionAllowedDirs.map(d => `  - ${d.replaceAll('\\', '/')}`).join('\n')}`
+              : 'No extra directories authorized yet. Usage: /allow-dir <dir>', 'info');
+            return;
+          }
+          if (raw === 'clear' || raw === '--clear') {
+            sessionAllowedDirs.length = 0;
+            ctx.ui.notify('Cleared extra authorized directories for this session.', 'info');
+            return;
+          }
+          const target = resolve(ctx.cwd, normalizeCliPath(raw));
+          const info = await stat(target).catch(() => null);
+          if (!info || !info.isDirectory()) {
+            ctx.ui.notify(`Directory not found: ${target.replaceAll('\\', '/')}`, 'warning');
+            return;
+          }
+          if (!sessionAllowedDirs.includes(target)) sessionAllowedDirs.push(target);
+          ctx.ui.notify(`Authorized extra directory for this session: ${target.replaceAll('\\', '/')} (safe edits & 0-quota file preloading enabled).`, 'info');
+        }
+      });
+
+      pi.registerCommand('remember', {
+        description: 'Save a project rule into .copi/instructions.md at 0 web quota (usage: /remember <rule|--list>)',
+        handler: async (args, ctx) => {
+          const raw = (args ?? '').trim();
+          if (!raw || raw === '--list' || raw === 'list') {
+            const current = await readProjectRules(ctx.cwd);
+            ctx.ui.notify(current.content
+              ? `${current.path}:\n\n${current.content}`
+              : `No rules saved in ${current.path} yet. Usage: /remember <rule>`, 'info');
+            return;
+          }
+          const saved = await appendProjectRule(ctx.cwd, raw);
+          if (!loadedInstructionFiles.includes('.copi/instructions.md')) {
+            loadedInstructionFiles.push('.copi/instructions.md');
+          }
+          ctx.ui.notify(`Saved rule to ${saved.path} (0 quota):\n  ${saved.bullet}\nTakes effect automatically on new sessions and tab rotations.`, 'info');
+        }
+      });
+
+      pi.registerCommand('logs', {
+        description: 'Show recent Copi activity/diagnostic events (usage: /logs [count])',
+        handler: async (args, ctx) => {
+          const count = (args ?? '').trim() ? Number(args.trim()) : 20;
+          const text = await formatRecentActivity(copiPaths, count);
+          ctx.ui.notify(text, 'info');
         }
       });
 
@@ -639,6 +752,8 @@ export function createWebUI(browser, {
             `Edge: ${liveStatus?.state ?? edgeState}${hostDetail}${versionNote}${pState?.needsNewChat ? ' · web needs /reconnect or /new' : ''}`,
             `Mode: ${readonlyState.enabled ? 'read-only (read, grep, find)' : 'read-write'} · undo turns: ${undoManager.turnCount()}`,
             `Instructions: ${loadedInstructionFiles.length ? loadedInstructionFiles.join(', ') : '(none)'}`,
+            ...(sessionAllowedDirs.length ? [`Allowed dirs: ${sessionAllowedDirs.map(d => d.replaceAll('\\', '/')).join(', ')}`] : []),
+            ...(pendingRunContext ? [`Pending /run: "${pendingRunContext.command}" (exit ${pendingRunContext.exitCode}) — attaches to next prompt`] : []),
             `Prompts: ${promptTemplates.length ? promptTemplates.map(p => `/${p.name}`).join(', ') : '(none)'}`,
             `Tools recorded: ${toolHistory.list().length} (Ctrl+O to expand, /inspect to view one)`,
             `Safety guard: ${autoApproveRisky ? 'auto-approved (--yes)' : 'confirm risky commands & outside writes'}`,
@@ -750,9 +865,10 @@ export function createWebUI(browser, {
           description: `[${template.source}] ${template.description}`,
           handler: async (args, ctx) => {
             const rendered = await renderPromptTemplate(template, { args: args ?? '', cwd: ctx.cwd });
-            const expanded = await expandFileMentions(rendered, ctx.cwd);
+            const expanded = await expandFileMentions(rendered, ctx.cwd, { allowedDirs: sessionAllowedDirs });
             if (expanded.loadedEntries?.length) providerControl?.notePreloadedFiles?.(expanded.loadedEntries);
-            pi.sendUserMessage(expanded.text);
+            const withRun = consumePendingRunContext(expanded.text);
+            pi.sendUserMessage(withRun.text);
           }
         });
       }

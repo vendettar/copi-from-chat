@@ -64,6 +64,12 @@ test('role markdown transformer distinguishes You vs Copi and toolHistory tracks
   );
   assert.match(diffUser, /Attached local git diff \(3 lines\)/);
   assert.doesNotMatch(diffUser, /\+line 2/);
+  const runUser = transform(
+    'Fix this failure.\n\n[Local /run output — already executed locally, no need to re-run]\nCommand: npm test\nExit code: 1\nOutput:\nAssertionError: boom',
+    { messageType: 'user' }
+  );
+  assert.match(runUser, /Attached local \/run output: `npm test` \(exit 1\)/);
+  assert.doesNotMatch(runUser, /AssertionError: boom/);
   const assistantOut = transform('Done.', { messageType: 'assistant' });
   assert.match(assistantOut, /^---\n\*\*▌ Copi\*\* `quick`\n\nDone\.$/);
   // Idempotent when called again.
@@ -236,6 +242,41 @@ test('web-ui commands (/status, /rename, /reconnect, /bell, tool_call safety gua
   };
   const conflicts = InteractiveMode.prototype.getBuiltInCommandConflictDiagnostics.call({}, fakeRunner);
   assert.deepEqual(conflicts, []);
+
+  // Test /allow-dir, /run (single-use auto-attach to next prompt), /remember, and /logs at 0 web quota!
+  const extraDir = join(root, 'extra-scripts');
+  await mkdir(extraDir);
+  await writeFile(join(extraDir, 'db.properties'), 'host=10.0.0.1\nport=8905\n');
+  // Before /allow-dir, editing extraDir triggers safety confirmation.
+  const blockedExtra = await handlers.get('tool_call')({ toolName: 'edit', input: { path: join(extraDir, 'db.properties') } }, ctx);
+  assert.equal(blockedExtra?.block, true);
+
+  await commands.get('allow-dir').handler(extraDir, ctx);
+  assert.match(notes.at(-1).msg, /Authorized extra directory/);
+  // After /allow-dir, editing extraDir is allowed without confirmation!
+  const allowedExtra = await handlers.get('tool_call')({ toolName: 'edit', input: { path: join(extraDir, 'db.properties') } }, ctx);
+  assert.equal(allowedExtra, undefined);
+
+  // /run executes locally at 0 quota and queues output once for the next user input.
+  await commands.get('run').handler('echo LOCAL_CHECK_OK', ctx);
+  assert.match(notes.at(-1).msg, /LOCAL_CHECK_OK/);
+  const nextInput = await handlers.get('input')({ text: `Check ${join(extraDir, 'db.properties').replaceAll('\\', '/')} please` }, ctx);
+  assert.equal(nextInput.action, 'transform');
+  assert.match(nextInput.text, /host=10\.0\.0\.1/, 'Authorized extraDir file should auto-preload at 0 quota');
+  assert.match(nextInput.text, /LOCAL_CHECK_OK/, 'Pending /run output should attach to next prompt');
+  // Second user message must NOT re-attach the already consumed /run output!
+  const secondInput = await handlers.get('input')({ text: 'Just another question' }, ctx);
+  assert.equal(secondInput.action, 'continue');
+
+  // /remember appends a project rule into .copi/instructions.md at 0 quota.
+  await commands.get('remember').handler('Always edit .properties with edit tool', ctx);
+  assert.match(notes.at(-1).msg, /Saved rule to/);
+  await commands.get('remember').handler('--list', ctx);
+  assert.match(notes.at(-1).msg, /Always edit \.properties with edit tool/);
+
+  // /logs formats activity log entries.
+  await commands.get('logs').handler('10', ctx);
+  assert.ok(typeof notes.at(-1).msg === 'string' && notes.at(-1).msg.length > 0);
 
   // Destructive tool_call blocked when user declines confirm dialog.
   const blocked = await handlers.get('tool_call')({ toolName: 'bash', input: { command: 'rm -rf /tmp/foo' } }, ctx);

@@ -109,6 +109,10 @@ test('compaction strips stale preloaded file dumps from older messages while kee
 
   const stripped = stripPreloadedFileContext('Fix src/stale.js' + preloadDump);
   assert.match(stripped, /^Fix src\/stale\.js\n\[earlier preloaded files omitted during compaction: src\/stale\.js\]$/);
+  const strippedRun = stripPreloadedFileContext(
+    'Fix test failure.\n\n[Local /run output — already executed locally, no need to re-run]\nCommand: npm test\nExit code: 1\nOutput:\nFAIL boom'
+  );
+  assert.match(strippedRun, /^Fix test failure\.\n\[earlier local \/run output omitted during compaction: npm test \(exit 1\)\]$/);
 
   const messages = [
     user('Initial goal.' + preloadDump),

@@ -1,4 +1,5 @@
 import { isAbsolute, relative, resolve } from 'node:path';
+import { normalizeCliPath } from './paths.js';
 
 const DESTRUCTIVE_BASH_RULES = [
   {
@@ -31,16 +32,27 @@ const DESTRUCTIVE_BASH_RULES = [
   }
 ];
 
-export function isPathOutsideWorkspace(cwd, targetPath) {
-  if (!cwd || typeof targetPath !== 'string' || !targetPath.trim()) return false;
-  const root = resolve(cwd);
-  const target = resolve(root, targetPath);
-  const rel = relative(root, target);
-  if (!rel) return false;
-  return rel === '..' || rel.startsWith('..\\') || rel.startsWith('../') || isAbsolute(rel);
+function isInsideDirectory(dir, target) {
+  const rel = relative(dir, target);
+  if (!rel) return true;
+  return rel !== '..' && !rel.startsWith('..\\') && !rel.startsWith('../') && !isAbsolute(rel);
 }
 
-export function assessToolRisk({ toolName, input = {}, cwd }) {
+export function isPathOutsideWorkspace(cwd, targetPath, allowedDirs = []) {
+  if (!cwd || typeof targetPath !== 'string' || !targetPath.trim()) return false;
+  const root = resolve(cwd);
+  const target = resolve(root, normalizeCliPath(targetPath));
+  if (isInsideDirectory(root, target)) return false;
+  if (Array.isArray(allowedDirs)) {
+    for (const extra of allowedDirs) {
+      if (typeof extra !== 'string' || !extra.trim()) continue;
+      if (isInsideDirectory(resolve(root, normalizeCliPath(extra)), target)) return false;
+    }
+  }
+  return true;
+}
+
+export function assessToolRisk({ toolName, input = {}, cwd, allowedDirs = [] }) {
   if (toolName === 'bash' && typeof input?.command === 'string') {
     const command = input.command.trim();
     for (const rule of DESTRUCTIVE_BASH_RULES) {
@@ -57,13 +69,13 @@ export function assessToolRisk({ toolName, input = {}, cwd }) {
   }
 
   if ((toolName === 'write' || toolName === 'edit') && typeof input?.path === 'string') {
-    if (isPathOutsideWorkspace(cwd, input.path)) {
-      const resolved = resolve(cwd, input.path);
+    if (isPathOutsideWorkspace(cwd, input.path, allowedDirs)) {
+      const resolved = resolve(cwd, normalizeCliPath(input.path));
       return {
         risky: true,
         title: `Confirm ${toolName} outside workspace`,
         reason: `Target path is outside the project directory (${resolved})`,
-        detail: `Tool "${toolName}" wants to modify a file outside the current workspace:\n\nWorkspace: ${resolve(cwd)}\nTarget:    ${resolved}\n\nAllow this file modification?`
+        detail: `Tool "${toolName}" wants to modify a file outside the current workspace:\n\nWorkspace: ${resolve(cwd)}\nTarget:    ${resolved}\n\nAllow this file modification? (Tip: use /allow-dir <dir> to authorize an extra folder for this session)`
       };
     }
   }

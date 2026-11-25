@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { normalizeCliPath } from './paths.js';
 
 const exec = promisify(execFile);
 const IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'vendor', '__pycache__', '.venv']);
@@ -109,17 +110,23 @@ export async function collectWorkspaceSnapshot(cwd, { maxChars = MAX_SNAPSHOT_CH
   return full.length <= maxChars ? full : `${full.slice(0, maxChars)}\n... [snapshot truncated]`;
 }
 
-// Match @path/to/file or @path/to/file:10-80 preceded by start-of-string, whitespace, or CJK/punctuation (never emails).
-const FILE_MENTION = /(?:^|[\s([{"'`，。！？、；：（）《》【】])@([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)(?::(\d+)(?:-(\d+))?)?/g;
-// Match plain relative workspace file paths (e.g. src/browser.js, package.json, test/a.js:10-40) without needing @.
-// Avoids URLs, emails, and path fragments preceded by @, :, /, or alphanumeric chars.
-const PLAIN_FILE_PATH = /(?<![A-Za-z0-9_@:/\\.-])((?:\.[\\/])?(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{1,10})(?::(\d+)(?:-(\d+))?)?(?![A-Za-z0-9_/.:-])/g;
+// Match @path/to/file (relative, Windows drive, or POSIX absolute) preceded by whitespace/CJK/punctuation (never emails).
+const FILE_MENTION = /(?:^|[\s([{"'`，。！？、；：（）《》【】])@((?:[A-Za-z]:[\\/]|[\\/])?[A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)(?::(\d+)(?:-(\d+))?)?/g;
+// Match plain relative workspace paths OR absolute paths (only loaded if inside cwd or allowedDirs).
+const PLAIN_FILE_PATH = /(?<![A-Za-z0-9_@:/\\.-])((?:[A-Za-z]:[\\/]|\.[\\/]|\/)?(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{1,12})(?::(\d+)(?:-(\d+))?)?(?![A-Za-z0-9_/.:-])/g;
 
 function hasIgnoredSegment(relPath) {
   return relPath.split('/').some(seg => IGNORED_DIRS.has(seg));
 }
 
+function isInsideDir(dir, target) {
+  const rel = relative(dir, target);
+  if (!rel) return true;
+  return rel !== '..' && !rel.startsWith('..\\') && !rel.startsWith('../') && !isAbsolute(rel);
+}
+
 export async function expandFileMentions(prompt, cwd, {
+  allowedDirs = [],
   maxFiles = MAX_PRELOAD_FILES,
   maxFileChars = MAX_PRELOAD_FILE_CHARS,
   maxTotalChars = MAX_PRELOAD_TOTAL_CHARS,
@@ -132,11 +139,14 @@ export async function expandFileMentions(prompt, cwd, {
     return { text: prompt, loadedFiles: [], loadedEntries: [] };
   }
   // Fast exit for plain prose with no @ mentions and no filename.ext tokens.
-  if (!prompt.includes('@') && !/[A-Za-z0-9_-]\.[A-Za-z0-9_-]{1,10}\b/.test(prompt)) {
+  if (!prompt.includes('@') && !/[A-Za-z0-9_-]\.[A-Za-z0-9_-]{1,12}\b/.test(prompt)) {
     return { text: prompt, loadedFiles: [], loadedEntries: [] };
   }
 
   const root = resolve(cwd);
+  const authorizedExtras = Array.isArray(allowedDirs)
+    ? allowedDirs.filter(d => typeof d === 'string' && d.trim()).map(d => resolve(root, normalizeCliPath(d)))
+    : [];
   const seenKeys = new Set();
   const seenFiles = new Set();
   const blocks = [];
@@ -150,18 +160,23 @@ export async function expandFileMentions(prompt, cwd, {
     if (blocks.length >= maxFiles || totalChars >= maxTotalChars) return;
     if (!explicit && (autoCount >= maxAutoFiles || autoChars >= maxAutoTotalChars)) return;
 
-    const rawRel = rawPath.replaceAll('\\', '/');
+    const rawRel = normalizeCliPath(rawPath).replaceAll('\\', '/');
     const startLine = startStr ? Math.max(1, Number(startStr)) : null;
     const endLine = endStr ? Math.max(startLine ?? 1, Number(endStr)) : null;
     const target = resolve(root, rawRel);
-    const rel = relative(root, target);
-    if (!rel || rel === '..' || rel.startsWith('..') || isAbsolute(rel)) return;
-    const displayPath = rel.replaceAll('\\', '/');
+    const inRoot = isInsideDir(root, target);
+    const matchedExtra = !inRoot ? authorizedExtras.find(dir => isInsideDir(dir, target)) : null;
+    if (!inRoot && !matchedExtra) return;
+    const rel = inRoot ? relative(root, target) : null;
+    if (inRoot && !rel) return;
+
+    const displayPath = inRoot ? rel.replaceAll('\\', '/') : target.replaceAll('\\', '/');
     const lowerBase = displayPath.split('/').at(-1)?.toLowerCase() ?? '';
     const dotIdx = lowerBase.lastIndexOf('.');
     const ext = dotIdx >= 0 ? lowerBase.slice(dotIdx) : '';
     if (SKIP_PRELOAD_EXTS.has(ext)) return;
-    if (!explicit && (hasIgnoredSegment(displayPath) || SKIP_AUTO_FILENAMES.has(lowerBase))) return;
+    const relForIgnore = inRoot ? displayPath : relative(matchedExtra, target).replaceAll('\\', '/');
+    if (!explicit && (hasIgnoredSegment(relForIgnore) || SKIP_AUTO_FILENAMES.has(lowerBase))) return;
 
     const key = `${displayPath}:${startLine ?? ''}:${endLine ?? ''}`;
     if (seenKeys.has(key)) return;

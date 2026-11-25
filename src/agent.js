@@ -14,7 +14,9 @@ const HELP = `Copi · Copilot from Chat
 
 Usage:
   copi [options] [prompt]
+  copi upgrade [--check]
   copi doctor
+  copi logs [N]
   copi host <status|stop>
   copi sessions [--all] [-C <dir>]
 
@@ -23,6 +25,7 @@ Options:
   [prompt]                Start a task and stay in the interactive session (supports @file & piped stdin)
   -p, --print             Run one task and exit (also used automatically when stdin/stdout is piped)
   -C, --cwd <dir>         Start in a project directory
+  --add-dir <dir>         Authorize an extra directory for edits & 0-quota preloading (repeatable)
   -c, --continue          Resume the most recent saved session for this project
   -s, --session <id>      Resume a saved session by ID or JSONL file path
   -m, --model <target>    Model mode: smart (default), quick, auto, think, or 0-based menu index
@@ -37,6 +40,10 @@ Options:
 Interactive commands:
   /model [smart|quick|auto|think|N]  Read live models from Edge or switch preference
   /think <prompt>                    Run one prompt with Think deeper, then restore previous preference
+  /run <command>                     Run a local command at 0 quota & auto-attach output to next prompt
+  /allow-dir [dir|clear]             Authorize an extra directory for safe edits & 0-quota preloading
+  /remember <rule|--list>            Save a project rule to .copi/instructions.md at 0 quota
+  /logs [N]                          Show recent Copi activity & diagnostic events
   /quota                             Show today's web turns by model tier and quota tips
   /undo [--yes]                      Revert file changes made during the last agent turn
   /readonly [on|off]                 Toggle read-only exploration mode
@@ -98,6 +105,8 @@ try {
       model: { type: 'string', short: 'm' },
       readonly: { type: 'boolean' },
       'no-preload': { type: 'boolean' },
+      'add-dir': { type: 'string', multiple: true },
+      check: { type: 'boolean' },
       yes: { type: 'boolean', short: 'y' },
       'no-bell': { type: 'boolean' },
       all: { type: 'boolean', short: 'a' },
@@ -110,6 +119,15 @@ try {
   } else if (values.version) {
     const pkg = JSON.parse(await readFile(PACKAGE_JSON, 'utf8'));
     console.log(pkg.version);
+  } else if (!values.print && positionals[0] === 'upgrade' && positionals.length === 1) {
+    const copiPaths = getCopiPaths(getCopiHome());
+    const { runUpgrade } = await import('./upgrade.js');
+    await runUpgrade({ paths: copiPaths, checkOnly: Boolean(values.check) });
+  } else if (!values.print && positionals[0] === 'logs' && positionals.length <= 2) {
+    const copiPaths = getCopiPaths(getCopiHome());
+    const { formatRecentActivity } = await import('./commands.js');
+    const count = positionals[1] ? Number(positionals[1]) : 20;
+    console.log(await formatRecentActivity(copiPaths, count));
   } else if (!values.print && positionals[0] === 'doctor' && positionals.length === 1) {
     const copiPaths = getCopiPaths(getCopiHome());
     const { runDoctor } = await import('./doctor.js');
@@ -174,6 +192,12 @@ try {
 
     const cwd = resolveTargetCwd(values.cwd);
     if (!(await stat(cwd)).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
+    const allowedDirs = [];
+    for (const rawDir of values['add-dir'] ?? []) {
+      const resolvedDir = resolve(cwd, normalizeCliPath(rawDir));
+      if (!(await stat(resolvedDir)).isDirectory()) throw new Error(`--add-dir is not a directory: ${resolvedDir}`);
+      allowedDirs.push(resolvedDir);
+    }
 
     const copiHome = getCopiHome();
     const copiPaths = await ensureCopiDirs(getCopiPaths(copiHome));
@@ -201,6 +225,7 @@ try {
       autoApproveRisky: Boolean(values.yes),
       readonly: Boolean(values.readonly),
       preloadWorkspace: !values['no-preload'],
+      allowedDirs,
       bell: values['no-bell'] ? false : undefined,
       prompt,
       interactive

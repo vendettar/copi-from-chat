@@ -28,7 +28,11 @@ copi -C C:/path/to/project "inspect @src/app.js and fix the crash"
 copi -C C:/path/to/project --model quick
 copi -C C:/path/to/project --readonly
 git diff | copi -p -C C:/path/to/project "review these changes"
+copi -C C:/path/to/project --add-dir C:/Dev/scripts
+copi upgrade --check
+copi upgrade
 copi doctor
+copi logs 30
 copi host status
 copi host stop
 copi sessions --all
@@ -81,6 +85,10 @@ The shared login state is stored under `~/.copi/shared-browser-profile`. `--prof
 
 - `/model [smart|quick|auto|think|<index>]`: read live models from Edge or switch model preference (`Ctrl+L`)
 - `/think <prompt>`: run one prompt with `Think deeper`, then restore your previous preference
+- `/run <command>`: run a local command at 0 web quota and auto-attach its output once to your next prompt (or `/fix`)
+- `/allow-dir [dir|clear]`: authorize an extra directory for safe edits and 0-quota file preloading
+- `/remember <rule|--list>`: append a persistent project rule to `.copi/instructions.md` at 0 web quota
+- `/logs [N]`: inspect recent activity & diagnostic events from `~/.copi/activity.jsonl`
 - `/quota`: show today's web turn breakdown (`think` / `quick` / `auto`) and quota-saving status
 - `/undo [--yes]`: revert file changes made by Copi during the last agent turn
 - `/readonly [on|off]`: toggle read-only exploration mode (`read`, `grep`, `find` only)
@@ -135,10 +143,10 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.1.6.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.2.0.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.1.6.tgz
+npm install -g ./copi-from-chat-0.2.0.tgz
 copi --help
 ```
 

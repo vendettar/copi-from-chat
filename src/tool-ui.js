@@ -133,11 +133,20 @@ function formatShortTime(timestamp) {
   return `${hh}:${mm}`;
 }
 
-const DISPLAY_PRELOAD_BLOCK = /\n\n\[Preloaded @?file context — [^\]]+\]\n([\s\S]*)$/;
+const DISPLAY_PRELOAD_BLOCK = /\n\n\[Preloaded @?file context — [^\]]+\]\n([\s\S]*?)(?=\n\n\[Local \/run output — |$)/;
+const DISPLAY_LOCAL_RUN_BLOCK = /\n\n\[Local \/run output — [^\]]+\]\n([\s\S]*)$/;
 const DISPLAY_DIFF_BLOCK = /\n\nGit diff:\n```diff\n([\s\S]*?)\n```$/;
 
 function collapsePreloadForDisplay(markdown) {
   let out = markdown;
+  let runBadge = '';
+  const localRun = DISPLAY_LOCAL_RUN_BLOCK.exec(out);
+  if (localRun) {
+    const cmd = singleLine(localRun[1].match(/^Command:\s*(.+)$/m)?.[1] ?? 'command', 64);
+    const exit = localRun[1].match(/^Exit code:\s*(\d+)$/m)?.[1];
+    runBadge = `\n\n> Attached local /run output: \`${cmd}\`${exit !== undefined ? ` (exit ${exit})` : ''}`;
+    out = out.slice(0, localRun.index);
+  }
   const preload = DISPLAY_PRELOAD_BLOCK.exec(out);
   if (preload) {
     const userText = out.slice(0, preload.index);
@@ -151,7 +160,7 @@ function collapsePreloadForDisplay(markdown) {
     const lineCount = diff[1].split(/\r?\n/).length;
     out = `${out.slice(0, diff.index)}\n\n> Attached local git diff (${lineCount} lines)`;
   }
-  return out;
+  return `${out}${runBadge}`;
 }
 
 export function createRoleMarkdownTransformer({ getModelTag = () => 'think' } = {}) {

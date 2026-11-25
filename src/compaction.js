@@ -3,20 +3,30 @@ export const DEFAULT_KEEP_RECENT = 6;
 const RECENT_TOOL_RESULT_COMPACT_MAX = 2400;
 
 const CHECK_COMMAND_PATTERN = /\b(test|check|lint|typecheck|tsc|build|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|mvn\s+test|gradle\s+test|npm\s+run\s+(?:test|check|lint|build)|git\s+status)\b/i;
-const PRELOADED_BLOCK_PATTERN = /\n\n\[Preloaded @?file context — [^\]]+\]\n([\s\S]*)$/;
+const PRELOADED_BLOCK_PATTERN = /\n\n\[Preloaded @?file context — [^\]]+\]\n([\s\S]*?)(?=\n\n\[Local \/run output — |$)/;
+const LOCAL_RUN_BLOCK_PATTERN = /\n\n\[Local \/run output — [^\]]+\]\n([\s\S]*)$/;
 
-// Strip synthetic auto-appended preloaded file dumps from older user messages during compaction
-// while keeping the user's actual typed instruction 100% verbatim.
+// Strip synthetic auto-appended preloaded file dumps and /run outputs from older user messages
+// during compaction while keeping the user's actual typed instruction 100% verbatim.
 export function stripPreloadedFileContext(text) {
   if (typeof text !== 'string') return text;
-  const match = PRELOADED_BLOCK_PATTERN.exec(text);
-  if (!match) return text;
-  const userText = text.slice(0, match.index);
+  let out = text;
+  const runMatch = LOCAL_RUN_BLOCK_PATTERN.exec(out);
+  if (runMatch) {
+    const cmd = runMatch[1].match(/^Command:\s*(.+)$/m)?.[1]?.trim() ?? 'command';
+    const exit = runMatch[1].match(/^Exit code:\s*(\d+)$/m)?.[1];
+    const suffix = `\n[earlier local /run output omitted during compaction: ${cmd.slice(0, 80)}${exit !== undefined ? ` (exit ${exit})` : ''}]`;
+    out = `${out.slice(0, runMatch.index)}${suffix}`;
+  }
+  const match = PRELOADED_BLOCK_PATTERN.exec(out);
+  if (!match) return out;
+  const before = out.slice(0, match.index);
+  const after = out.slice(match.index + match[0].length);
   const files = [...match[1].matchAll(/^--- @?(.+?) ---$/gm)].map(m => m[1].trim()).filter(Boolean);
   const note = files.length
     ? `\n[earlier preloaded files omitted during compaction: ${files.join(', ')}]`
     : '';
-  return `${userText}${note}`;
+  return `${before}${note}${after}`;
 }
 
 function stripMessagePreloads(message) {

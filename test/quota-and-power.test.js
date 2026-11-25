@@ -19,6 +19,7 @@ import { loadPromptTemplates, renderPromptTemplate } from '../src/prompts.js';
 import { detectWebLimitNotice, formatQuotaShort, markThinkLimitedToday, readTodayQuota, recordWebTurn } from '../src/quota.js';
 import { createSearchTools } from '../src/search-tools.js';
 import { createUndoManager } from '../src/undo.js';
+import { compareSemver, runUpgrade } from '../src/upgrade.js';
 
 const exec = promisify(execFile);
 const user = text => ({ role: 'user', content: text, timestamp: 1 });
@@ -577,4 +578,82 @@ test('short monotonic requestIds recover gracefully when model mistypes/echoes p
   assert.equal(r3.stopReason, 'error');
   assert.match(r3.errorMessage, /Reply markers belong to a different request/);
   assert.equal(seen.length, 4);
+});
+
+test('copi upgrade compares semver, preserves Edge when up-to-date, and stops Browser Host before installing newer .tgz', async () => {
+  assert.equal(compareSemver('0.2.0', '0.1.6'), 1);
+  assert.equal(compareSemver('0.2.0', '0.2.0'), 0);
+  assert.equal(compareSemver('0.1.9', '0.2.0'), -1);
+
+  const mockFetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      tag_name: 'v0.2.0',
+      name: 'v0.2.0 — Power Upgrade',
+      html_url: 'https://github.com/vendettar/copi-from-chat/releases/tag/v0.2.0',
+      assets: [{ name: 'copi-from-chat-0.2.0.tgz', browser_download_url: 'https://example.test/copi-0.2.0.tgz' }]
+    })
+  });
+
+  // Case 1: Already at latest -> must NOT stop Browser Host!
+  let stopped = 0;
+  let installed = null;
+  const noopLog = () => {};
+  const same = await runUpgrade({
+    paths: { browserHostFile: '/tmp/unused' },
+    currentVersion: '0.2.0',
+    fetchImpl: mockFetch,
+    stopHost: async () => { stopped++; return { stopped: true }; },
+    installPackage: async url => { installed = url; },
+    log: noopLog
+  });
+  assert.equal(same.alreadyLatest, true);
+  assert.equal(stopped, 0);
+  assert.equal(installed, null);
+
+  // Case 2: --check reports update available without stopping host or installing.
+  const checked = await runUpgrade({
+    paths: { browserHostFile: '/tmp/unused' },
+    currentVersion: '0.1.6',
+    checkOnly: true,
+    fetchImpl: mockFetch,
+    stopHost: async () => { stopped++; return { stopped: true }; },
+    installPackage: async url => { installed = url; },
+    log: noopLog
+  });
+  assert.equal(checked.updateAvailable, true);
+  assert.equal(stopped, 0);
+  assert.equal(installed, null);
+
+  // Case 3: Upgrade stops host first, then installs exact .tgz URL!
+  const upgraded = await runUpgrade({
+    paths: { browserHostFile: '/tmp/unused' },
+    currentVersion: '0.1.6',
+    fetchImpl: mockFetch,
+    stopHost: async () => { stopped++; return { stopped: true, pid: 999 }; },
+    installPackage: async url => { installed = url; },
+    log: noopLog
+  });
+  assert.equal(upgraded.updated, true);
+  assert.equal(stopped, 1);
+  assert.equal(installed, 'https://example.test/copi-0.2.0.tgz');
+});
+
+test('provider emits live streaming phase and character progress via onStatus without writing scrollback', async () => {
+  const statuses = [];
+  const provider = createCopilotProvider({
+    async ask(prompt, options) {
+      const req = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+      await options.onSnapshot({ text: `<<<COPILOT_REPLY_START:${req.requestId}>>>\n\`\`\`json\n{"requestId":"${req.requestId}","type":"final","lines":["` + 'a'.repeat(450) });
+      const text = JSON.stringify({ requestId: req.requestId, type: 'final', lines: ['Done.'] });
+      return { completed: true, text, codeBlocks: [text] };
+    }
+  }, { onStatus: msg => statuses.push(msg) });
+
+  const stream = provider.streamSimple(provider.getModels()[0], normalizeContext(base), { sessionId: 'stream-prog' });
+  for await (const _ of stream) {}
+  await stream.result();
+  assert.ok(statuses.some(s => /Sending to Copilot \(think\)/.test(s)));
+  assert.ok(statuses.some(s => /Drafting answer \(think, 0\.5K chars\)/.test(s)));
 });

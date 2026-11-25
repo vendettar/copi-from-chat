@@ -34,7 +34,8 @@ const CLI_VERSION = (() => {
 const RESERVED_COMMANDS = new Set([
   'new', 'resume', 'quit', 'exit', 'model', 'think', 'quota', 'undo', 'readonly',
   'doctor', 'export', 'inspect', 'copy', 'copy-code', 'diff', 'status', 'rename', 'reconnect',
-  'cleanup', 'bell', 'web', 'help', 'settings', 'compact', 'fork', 'tree', 'clone', 'import',
+  'cleanup', 'bell', 'web', 'run', 'allow-dir', 'remember', 'logs',
+  'help', 'settings', 'compact', 'fork', 'tree', 'clone', 'import',
   'thinking', 'scoped-models', 'share', 'bug', 'name', 'session', 'changelog', 'hotkeys',
   'trust', 'login', 'logout', 'reload'
 ]);
@@ -395,6 +396,7 @@ export async function createRuntime({
   autoApproveRisky = false,
   readonly = false,
   preloadWorkspace = true,
+  allowedDirs = [],
   allowNonGitFallback,
   allowPlainTextFinal,
   bellState,
@@ -445,6 +447,8 @@ export async function createRuntime({
     providerControl,
     loadedInstructionFiles: projectInstructions.files,
     promptTemplates,
+    allowedDirs,
+    shellPath: resolveShellPath(),
     autoApproveRisky,
     readonlyState,
     bellState,
@@ -569,6 +573,7 @@ export async function runAgent({
   autoApproveRisky = false,
   readonly = false,
   preloadWorkspace = true,
+  allowedDirs = [],
   bell,
   prompt,
   interactive,
@@ -607,6 +612,7 @@ export async function runAgent({
         autoApproveRisky: effectiveAutoApprove,
         readonly,
         preloadWorkspace,
+        allowedDirs,
         bellState,
         sharedBrowserOptions
       });
@@ -621,7 +627,7 @@ export async function runAgent({
     });
 
     if (interactive) {
-      const expanded = prompt ? await expandFileMentions(prompt, runtime.cwd) : null;
+      const expanded = prompt ? await expandFileMentions(prompt, runtime.cwd, { allowedDirs }) : null;
       if (expanded?.loadedEntries?.length) {
         activeProviderControl?.notePreloadedFiles?.(expanded.loadedEntries);
       }
@@ -642,7 +648,7 @@ export async function runAgent({
       });
       process.on('SIGINT', interrupt);
       process.on('SIGTERM', interrupt);
-      const expanded = await expandFileMentions(prompt, runtime.cwd);
+      const expanded = await expandFileMentions(prompt, runtime.cwd, { allowedDirs });
       if (expanded.loadedEntries?.length) {
         activeProviderControl?.notePreloadedFiles?.(expanded.loadedEntries);
       }
