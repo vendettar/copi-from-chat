@@ -178,9 +178,31 @@ function compareInput(actual, expected, contentEditable) {
   return { received, matches: received === expected, ignored };
 }
 
+export async function isCleanSignedInChatPage(page) {
+  if (!page || page.isClosed()) return false;
+  const url = page.url() || '';
+  if (!url.startsWith('https://m365.cloud.microsoft/')) return false;
+  try {
+    const ready = await page.locator(INPUT).first().isVisible();
+    if (!ready) return false;
+    const replies = await page.locator(RESPONSES).count();
+    if (replies > 0) return false;
+    const draft = await page.locator(INPUT).evaluateAll(readComposerState);
+    return draft.count === 1 && !normalize(draft.text);
+  } catch {
+    return false;
+  }
+}
+
 export async function waitForChatReady(page, { signal, onStatus = () => {} } = {}) {
   signal?.throwIfAborted();
-  await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  // Reuse an already signed-in clean M365 chat tab immediately without reloading (avoids re-triggering SSO).
+  if (await isCleanSignedInChatPage(page)) return;
+  const currentUrl = page.url() || '';
+  const alreadyInM365OrAuth = /^https:\/\/(?:m365\.cloud\.microsoft\/|login\.microsoftonline\.com\/|login\.live\.com\/)/i.test(currentUrl);
+  if (!alreadyInM365OrAuth) {
+    await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  }
   if (!await page.locator(INPUT).first().isVisible()) {
     onStatus('Sign in to Microsoft 365 in the Edge window.');
   }
@@ -423,23 +445,39 @@ export class CopilotTab {
     }
   }
 
-  async closePage() {
+  detachPage() {
     const page = this.page;
     this.page = null;
     this.lastReply = null;
     this.appliedModelKey = null;
+    return page;
+  }
+
+  async closePage() {
+    const page = this.detachPage();
     if (page && !page.isClosed()) {
       await page.close().catch(() => {});
     }
   }
 
   async resetTab({ warm = false, signal, onStatus = () => {} } = {}) {
-    await this.closePage();
+    const oldPage = this.detachPage();
     this.uncertain = false;
     this.used = false;
     this.lastSelectedModel = null;
-    if (warm) {
-      void this.warm({ signal, onStatus }).catch(() => {});
+    if (warm && typeof this.openFreshPage === 'function') {
+      // Open the replacement tab BEFORE closing oldPage so Edge never loses its last tab
+      // (which would close the browser window and clear corporate session-only SSO cookies).
+      try {
+        this.page = await this.openFreshPage({ signal, onStatus });
+      } catch {
+        // If opening fresh fails, still clean up oldPage only if it isn't the sole tab.
+      }
+      if (oldPage && oldPage !== this.page && !oldPage.isClosed()) {
+        await oldPage.close().catch(() => {});
+      }
+    } else if (oldPage && !oldPage.isClosed()) {
+      await oldPage.close().catch(() => {});
     }
     return { reset: true };
   }

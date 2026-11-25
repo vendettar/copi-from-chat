@@ -154,3 +154,55 @@ test('Shared Browser Host isolates parallel sessions into dedicated tabs and reu
     error => error.code === 'COPILOT_CONTEXT_LOST' && error.beforeSend === true && error.retryableInFreshChat === true
   );
 });
+
+test('detaching an empty startup session for /resume reuses the signed-in tab without closing Edge or reloading, and /reconnect keeps Edge alive', async t => {
+  if (!engine) { t.skip('An installed Edge/Chrome browser is required.'); return; }
+  const root = await mkdtemp(join(tmpdir(), 'copi-host-standby-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const paths = await ensureCopiDirs(getCopiPaths(root));
+
+  const context = await engine.newContext();
+  context.setDefaultTimeout(3000);
+  let pageLoads = 0;
+  await context.route('https://m365.cloud.microsoft/chat', route => {
+    pageLoads++;
+    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: mockChatHtml() });
+  });
+
+  const host = await startBrowserHost({ paths, context, sendConfirmTimeoutMs: 600, sendConfirmPollMs: 40 });
+  t.after(() => host.shutdown('test'));
+
+  // 1. Startup empty session S1 warms Edge (single tab) and user signs in.
+  const startupSession = new SharedBrowserClient({ paths, sessionId: 'empty-startup' });
+  const warm1 = await startupSession.warm({ wait: true });
+  assert.equal(warm1.ready, true);
+  assert.equal(pageLoads, 1);
+  assert.equal(context.pages().filter(p => !p.isClosed()).length, 1);
+  const initialTabId = await context.pages()[0].evaluate(() => window.tabId);
+
+  // 2. User runs /resume -> S1 shuts down empty with closeTab: true.
+  // Edge must NOT close its sole tab!
+  await startupSession.close({ closeTab: true });
+  assert.equal(context.pages().filter(p => !p.isClosed()).length, 1);
+
+  // 3. Resumed session S2 warms & sends -> adopts S1's already signed-in tab with ZERO page reload!
+  const resumedSession = new SharedBrowserClient({ paths, sessionId: 'resumed-session' });
+  const warm2 = await resumedSession.warm({ wait: true });
+  assert.equal(warm2.ready, true);
+  assert.equal(pageLoads, 1, 'Resumed session should reuse the clean signed-in standby tab without reloading');
+
+  const reply1 = await resumedSession.ask('Continue resumed work', { fresh: true });
+  assert.match(reply1.text, new RegExp(`TAB:${initialTabId}\\|`));
+  assert.equal(pageLoads, 1);
+
+  // 4. User runs /reconnect while S2 is the ONLY tab in Edge -> must open replacement BEFORE closing old tab!
+  let droppedToZero = false;
+  const pageCountObserver = () => {
+    if (context.pages().filter(p => !p.isClosed()).length === 0) droppedToZero = true;
+  };
+  for (const p of context.pages()) p.once('close', pageCountObserver);
+  await resumedSession.resetTab({ warm: true });
+  assert.equal(droppedToZero, false, '/reconnect must never drop Edge to 0 open tabs');
+  assert.equal(context.pages().filter(p => !p.isClosed()).length, 1);
+  assert.equal(pageLoads, 2);
+});

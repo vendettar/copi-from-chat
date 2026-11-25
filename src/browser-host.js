@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CopilotTab, launchPersistentEdge, waitForChatReady } from './browser.js';
+import { CopilotTab, isCleanSignedInChatPage, launchPersistentEdge, waitForChatReady } from './browser.js';
 import { getCopiPaths } from './paths.js';
 import { logActivity, readConfig } from './storage.js';
 
@@ -56,7 +56,7 @@ export async function startBrowserHost({
   channel = process.platform === 'win32' ? 'msedge' : 'chrome',
   headless = false,
   context: injectedContext = null,
-  version = '0.1.4',
+  version = '0.1.5',
   idleTimeoutMinutes,
   sendConfirmTimeoutMs,
   sendConfirmPollMs,
@@ -73,6 +73,7 @@ export async function startBrowserHost({
   let contextLaunchPromise = null;
   let initialPageAdopted = false;
   let closed = false;
+  const standbyPages = [];
 
   const ensureContext = async () => {
     if (context) return context;
@@ -111,13 +112,16 @@ export async function startBrowserHost({
     }
   };
 
-  const openPageForContext = async (ctx, options) => {
+  const acquirePageForContext = async ctx => {
+    while (standbyPages.length) {
+      const candidate = standbyPages.pop();
+      if (candidate && !candidate.isClosed()) return candidate;
+    }
     const pages = ctx.pages();
     const reusableBlank = !initialPageAdopted && pages.length === 1 && !pages[0].isClosed()
       && (!pages[0].url() || pages[0].url() === 'about:blank');
     const page = reusableBlank ? pages[0] : await ctx.newPage();
     initialPageAdopted = true;
-    await waitForChatReady(page, options);
     return page;
   };
 
@@ -136,12 +140,26 @@ export async function startBrowserHost({
       ...(replyTimeoutMs !== undefined ? { replyTimeoutMs } : {}),
       ensurePage: async options => {
         const ctx = await ensureContext();
-        if (tab.page && !tab.page.isClosed()) return;
-        tab.page = await openPageForContext(ctx, options);
-        await logActivity(paths, 'tab_open', { sessionId });
+        if (!tab.page || tab.page.isClosed()) {
+          tab.page = await acquirePageForContext(ctx);
+          await logActivity(paths, 'tab_open', { sessionId });
+        }
+        await waitForChatReady(tab.page, options);
       },
       openFreshPage: async options => {
         const ctx = await ensureContext();
+        // Reuse a clean signed-in standby tab if one is waiting, otherwise open a new tab.
+        while (standbyPages.length) {
+          const candidate = standbyPages.pop();
+          if (candidate && !candidate.isClosed() && await isCleanSignedInChatPage(candidate)) {
+            await logActivity(paths, 'tab_reuse_standby', { sessionId, fresh: true });
+            return candidate;
+          }
+          if (candidate && !candidate.isClosed()) {
+            standbyPages.unshift(candidate);
+            break;
+          }
+        }
         const page = await ctx.newPage();
         initialPageAdopted = true;
         await waitForChatReady(page, options);
@@ -335,9 +353,23 @@ export async function startBrowserHost({
           entry.lastActiveAt = Date.now();
           if (entry.activeAbort) entry.activeAbort.abort();
           if (body.closeTab && entry.attachedCount === 0 && !entry.tab.busy) {
-            await entry.tab.closePage();
-            sessions.delete(sessionId);
-            await logActivity(paths, 'tab_close', { sessionId, reason: body.reason ?? 'detach' });
+            const page = entry.tab.page;
+            const livePages = context ? context.pages().filter(p => !p.isClosed()) : [];
+            const isLastTab = Boolean(page && !page.isClosed() && livePages.length <= 1);
+            if (page && !page.isClosed() && !entry.tab.used && (isLastTab || standbyPages.length < 2)) {
+              // Keep unused signed-in (or in-progress login) tabs alive in standbyPages so /resume, /new,
+              // or the next copi window reuses them immediately without closing Edge or losing SSO cookies.
+              const parked = entry.tab.detachPage();
+              if (parked && !parked.isClosed()) standbyPages.push(parked);
+              sessions.delete(sessionId);
+              await logActivity(paths, 'tab_park_standby', { sessionId, reason: body.reason ?? 'detach', isLastTab });
+            } else if (!isLastTab) {
+              await entry.tab.closePage();
+              sessions.delete(sessionId);
+              await logActivity(paths, 'tab_close', { sessionId, reason: body.reason ?? 'detach' });
+            } else {
+              await logActivity(paths, 'tab_keep_last', { sessionId, reason: body.reason ?? 'detach' });
+            }
           }
         }
         await evictIdleTabsIfNeeded();
