@@ -1,6 +1,7 @@
 import { basename } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { truncateToWidth } from '@earendil-works/pi-tui';
+import { formatModelPreference } from './model-preference.js';
 import { isLockedByOther, logActivity, recordToolCheckpoint } from './storage.js';
 
 async function readSessionIdFromFile(filePath) {
@@ -22,6 +23,7 @@ export function createWebUI(browser, {
   sessionId,
   profile,
   sessionLock,
+  modelController,
   getSessionMessageCount = () => 0
 } = {}) {
   let ui, workingMessage;
@@ -57,7 +59,7 @@ export function createWebUI(browser, {
           invalidate() {},
           render: width => [
             theme.fg('accent', 'Copi · Copilot from Chat'),
-            theme.fg('dim', 'Enter to send · Esc to stop · /new · /resume · /web · /quit')
+            theme.fg('dim', 'Enter to send · Esc to stop · /model · /new · /resume · /web · /quit')
           ].map(line => truncateToWidth(line, width))
         }));
         ui.setFooter((tui, theme, data) => {
@@ -151,17 +153,23 @@ export function createWebUI(browser, {
       });
 
       pi.registerCommand('web', {
-        description: 'Show workspace, session, browser mode, and tools',
+        description: 'Show workspace, session, browser mode, model preference, and tools',
         handler: async (_args, ctx) => {
           const browserMode = profile
             ? `isolated Edge profile "${profile}"`
             : browser?.mode === 'shared'
               ? 'shared Edge window (per-session tab)'
               : 'direct Edge session';
+          const modelPref = modelController ? formatModelPreference(modelController.getPreference()) : null;
+          const activeModel = modelController?.getLastSelectedLabel?.() ?? browser?.lastSelectedModel ?? null;
+          const modelLine = modelPref
+            ? `Model: ${modelPref}${activeModel ? ` (active: ${activeModel})` : ''}`
+            : null;
           ctx.ui.notify([
             `Workspace: ${ctx.cwd}`,
             ...(sessionId ? [`Session: ${sessionId}`] : []),
             `Browser: ${browserMode}`,
+            ...(modelLine ? [modelLine] : []),
             'Tools: read, bash, edit, write, grep, find'
           ].join('\n'), 'info');
         }

@@ -6,8 +6,9 @@ import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAgentSessionRuntime, SessionManager } from '@earendil-works/pi-coding-agent';
-import { createRuntime, resolveSessionManager } from '../src/runtime.js';
+import { createModelController, createRuntime, resolveSessionManager } from '../src/runtime.js';
 import { ensureCopiDirs, getCopiPaths } from '../src/paths.js';
+import { readConfig } from '../src/storage.js';
 
 process.env.PI_OFFLINE = '1';
 const packet = (request, value) => {
@@ -359,9 +360,67 @@ test('copi CLI --help and --version print standalone metadata', async () => {
   assert.match(helpOut, /Usage: copi \[options\] \[prompt\]/);
   assert.match(helpOut, /--continue/);
   assert.match(helpOut, /--session <id>/);
+  assert.match(helpOut, /--model <target>/);
   assert.match(helpOut, /--profile <name>/);
+  assert.match(helpOut, /\/model/);
   assert.match(helpOut, /\/resume/);
 
   const { stdout: versionOut } = await exec(process.execPath, ['src/agent.js', '--version']);
-  assert.match(versionOut.trim(), /^\d+\.\d+\.\d+$/);
+  assert.equal(versionOut.trim(), '0.0.8');
+});
+
+test('interactive startup pre-warms Edge and modelController persists and applies preferences', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'copi-model-ctrl-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const copiHome = join(root, 'copi-home');
+  await mkdir(cwd);
+  const copiPaths = await ensureCopiDirs(getCopiPaths(copiHome));
+
+  let warmed = 0;
+  const switched = [];
+  const mockBrowser = {
+    async warm() { warmed++; return { ready: true }; },
+    async listModels() {
+      return {
+        ready: true,
+        current: '自动',
+        models: [
+          { index: 0, label: '自动', description: '', selected: true },
+          { index: 1, label: '快速响应', description: '', selected: false },
+          { index: 2, label: '深度思考', description: '', selected: false }
+        ]
+      };
+    },
+    async setModelPreference(pref) {
+      switched.push(pref);
+      return { preference: pref, applied: true, result: { index: 1, label: '快速响应' } };
+    },
+    async ask(prompt) {
+      const request = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+      return final(request, 'OK.');
+    },
+    async close() {}
+  };
+
+  const controller = createModelController({ copiPaths });
+  const runtime = await createAgentSessionRuntime(
+    options => createRuntime({
+      ...options,
+      browser: mockBrowser,
+      copiPaths,
+      modelController: controller,
+      prewarmBrowser: true
+    }),
+    { cwd, agentDir: copiHome, sessionManager: SessionManager.inMemory(cwd) }
+  );
+  t.after(() => runtime.dispose());
+
+  assert.equal(warmed, 1, 'Expected prewarmBrowser to launch Edge immediately on startup');
+  const listed = await controller.listModels();
+  assert.equal(listed.models.length, 3);
+  const res = await controller.setPreference('quick');
+  assert.equal(res.applied, true);
+  assert.deepEqual(switched, [{ kind: 'preset', name: 'quick' }]);
+  assert.deepEqual(await readConfig(copiPaths), { modelPreference: 'quick' });
 });

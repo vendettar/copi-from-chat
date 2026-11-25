@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { appendFile, mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { appendFile, mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -208,4 +208,25 @@ export async function readIncompleteCheckpoints(paths, sessionId) {
     else if (entry.phase === 'completed' || entry.phase === 'error') started.delete(entry.toolCallId);
   }
   return [...started.values()];
+}
+
+export async function readConfig(paths) {
+  if (!paths?.configFile) return {};
+  try {
+    const raw = await readFile(paths.configFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function saveConfig(paths, patch = {}) {
+  if (!paths?.configFile) return {};
+  const next = { ...(await readConfig(paths)), ...patch };
+  await mkdir(dirname(paths.configFile), { recursive: true });
+  const temp = `${paths.configFile}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await rename(temp, paths.configFile);
+  return next;
 }

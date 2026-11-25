@@ -47,6 +47,7 @@ export function getCopiPaths(home = getCopiHome()) {
     checkpointsDir: join(root, 'checkpoints'),
     locksDir: join(root, 'locks'),
     browserHostFile: join(root, 'browser-host.json'),
+    configFile: join(root, 'config.json'),
     inputDiagnosticFile: join(root, 'input-diagnostic.json')
   };
 }

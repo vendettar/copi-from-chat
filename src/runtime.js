@@ -1,17 +1,23 @@
 import { accessSync, constants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
+import { Container, SelectList, Spacer, Text } from '@earendil-works/pi-tui';
 import {
   createAgentSessionRuntime, createAgentSessionServices, createAgentSessionFromServices,
   InteractiveMode, ModelRuntime, SessionManager, SettingsManager
 } from '@earendil-works/pi-coding-agent';
 import { CopilotBrowser } from './browser.js';
 import { SharedBrowserClient } from './browser-client.js';
+import {
+  DEFAULT_MODEL_PREFERENCE, formatModelPreference, getBuiltinModelPresets,
+  parseModelPreference, presetAliasForIndex
+} from './model-preference.js';
 import { createCopilotProvider } from './pi-provider.js';
 import { createWebUI } from './web-ui.js';
 import { createSearchTools } from './search-tools.js';
 import {
-  acquireProfileLock, acquireSessionLock, logActivity, readIncompleteCheckpoints
+  acquireProfileLock, acquireSessionLock, logActivity,
+  readConfig, readIncompleteCheckpoints, saveConfig
 } from './storage.js';
 
 function pathAccessible(filePath) {
@@ -40,9 +46,157 @@ export function resolveShellPath(env = process.env, platform = process.platform)
   return undefined;
 }
 
-// Keep /resume enabled via Pi's SessionSelectorComponent while blocking in-place branching/rewind
-// that cannot rewind a live M365 web conversation.
+const SELECT_THEME = {
+  selectedPrefix: text => `\x1b[36m${text}\x1b[0m`,
+  selectedText: text => `\x1b[1;36m${text}\x1b[0m`,
+  description: text => `\x1b[2m${text}\x1b[0m`,
+  scrollInfo: text => `\x1b[2m${text}\x1b[0m`,
+  noMatch: text => `\x1b[33m${text}\x1b[0m`
+};
+
+export function createModelController({ copiPaths, initialPreference = DEFAULT_MODEL_PREFERENCE } = {}) {
+  let preference = parseModelPreference(initialPreference);
+  let activeBrowser = null;
+  let lastSelectedLabel = null;
+
+  return {
+    getPreference: () => preference,
+    getLastSelectedLabel: () => activeBrowser?.lastSelectedModel ?? lastSelectedLabel,
+    attachBrowser(browser) {
+      activeBrowser = browser;
+      if (browser && 'modelPreference' in browser) {
+        try { browser.modelPreference = preference; } catch { /* mock browser */ }
+      }
+    },
+    async listModels({ openIfNeeded = false } = {}) {
+      if (typeof activeBrowser?.listModels !== 'function') {
+        return { ready: false, current: lastSelectedLabel, models: [], reason: 'unsupported' };
+      }
+      const data = await activeBrowser.listModels({ openIfNeeded });
+      if (data?.current) lastSelectedLabel = data.current;
+      return data;
+    },
+    async setPreference(input, { applyNow = true, persist = true } = {}) {
+      const parsed = parseModelPreference(input);
+      preference = parsed;
+      if (persist && copiPaths) {
+        await saveConfig(copiPaths, { modelPreference: formatModelPreference(parsed) }).catch(() => {});
+      }
+      let applied = false;
+      let result = null;
+      if (typeof activeBrowser?.setModelPreference === 'function') {
+        const response = await activeBrowser.setModelPreference(parsed, { applyNow });
+        applied = Boolean(response?.applied);
+        result = response?.result ?? null;
+        if (result?.label) lastSelectedLabel = result.label;
+      }
+      return { preference: parsed, applied, result };
+    }
+  };
+}
+
+// Keep /resume enabled via Pi's SessionSelectorComponent and take over /model for M365 web model selection,
+// while blocking in-place branching/rewind that cannot rewind a live M365 web conversation.
 class CopiInteractiveMode extends InteractiveMode {
+  constructor(runtime, options = {}) {
+    const { modelController, ...superOptions } = options;
+    super(runtime, superOptions);
+    this.modelController = modelController;
+  }
+
+  async _applyModelChoice(input) {
+    try {
+      const { preference, applied, result } = await this.modelController.setPreference(input, { applyNow: true, persist: true });
+      const prefText = formatModelPreference(preference);
+      if (applied && result?.label) {
+        const idx = result.index !== undefined ? `[${result.index}] ` : '';
+        this.showStatus(`Web model switched to ${idx}${result.label} (${prefText})`);
+      } else {
+        this.showStatus(`Web model preference set to "${prefText}" (will apply once Edge chat is ready)`);
+      }
+    } catch (error) {
+      this.showError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async handleModelCommand(searchTerm) {
+    if (!this.modelController) {
+      this.showWarning('Web model selector is unavailable in this session.');
+      return;
+    }
+    const arg = (searchTerm ?? '').trim();
+    if (!arg || arg === 'list' || arg === 'ls') {
+      await this.showModelSelector();
+      return;
+    }
+    await this._applyModelChoice(arg);
+  }
+
+  async showModelSelector() {
+    if (!this.modelController) {
+      this.showWarning('Web model selector is unavailable in this session.');
+      return;
+    }
+    this.showStatus('Reading models from Edge...');
+    const live = await this.modelController.listModels({ openIfNeeded: false }).catch(() => ({
+      ready: false, current: null, models: [], reason: 'read_error'
+    }));
+    const currentPref = formatModelPreference(this.modelController.getPreference());
+
+    let headerText;
+    let items;
+    let initialIndex = 0;
+
+    if (live.ready && Array.isArray(live.models) && live.models.length > 0) {
+      headerText = `Web models (live from Edge · preference: ${currentPref})`;
+      items = live.models.map(item => {
+        const alias = presetAliasForIndex(item.index, live.models.length);
+        const meta = [
+          alias ? `alias: ${alias}` : '',
+          item.selected ? 'current' : '',
+          item.description
+        ].filter(Boolean).join(' · ');
+        return {
+          value: String(item.index),
+          label: `[${item.index}] ${item.label}`,
+          description: meta || undefined
+        };
+      });
+      const currentIdx = live.models.findIndex(item => item.selected);
+      if (currentIdx >= 0) initialIndex = currentIdx;
+    } else {
+      const reasonHint = live.reason === 'not_signed_in'
+        ? 'Sign in to Microsoft 365 in Edge, then run /model again to see the live list.'
+        : live.reason === 'busy'
+          ? 'Edge tab is busy; select a preset for the next turn.'
+          : 'Edge chat is still loading; pick a preset now (applies automatically once ready).';
+      headerText = `Web model presets (current preference: ${currentPref}) — ${reasonHint}`;
+      items = getBuiltinModelPresets();
+      const presetIdx = items.findIndex(item => item.value === currentPref);
+      if (presetIdx >= 0) initialIndex = presetIdx;
+    }
+
+    this.showSelector(done => {
+      const container = new Container();
+      container.addChild(new Text(`\x1b[1m${headerText}\x1b[0m`, 0, 0));
+      container.addChild(new Spacer(1));
+      const list = new SelectList(items, Math.min(8, Math.max(1, items.length)), SELECT_THEME);
+      list.setSelectedIndex(initialIndex);
+      list.onSelect = item => {
+        done();
+        this.ui.requestRender();
+        void this._applyModelChoice(item.value);
+      };
+      list.onCancel = () => {
+        done();
+        this.ui.requestRender();
+      };
+      container.addChild(list);
+      container.addChild(new Text('\x1b[2mUse ↑/↓ + Enter to choose, Esc to cancel, or /model auto|quick|think|<index>\x1b[0m', 0, 0));
+      return { component: container, focus: list };
+    });
+  }
+
   async handleImportCommand() { this.showWarning('Session import is disabled. Use /resume or /new.'); }
   showUserMessageSelector() { this.showWarning('Session branching within an existing web conversation is disabled. Use /new or /resume.'); }
   showTreeSelector() { this.showWarning('History rewind within an existing web conversation is disabled. Use /new or /resume.'); }
@@ -138,6 +292,8 @@ export async function createRuntime({
   browser,
   copiPaths,
   profile,
+  modelController,
+  prewarmBrowser = false,
   sharedBrowserOptions
 }) {
   const sessionId = sessionManager.getSessionId();
@@ -146,16 +302,21 @@ export async function createRuntime({
     sessionLock = await acquireSessionLock(copiPaths, sessionId);
   }
 
+  const initialModelPref = modelController?.getPreference() ?? DEFAULT_MODEL_PREFERENCE;
   const activeBrowser = browser ?? (profile
     ? new CopilotBrowser({
       profileDir: copiPaths.profileDir(profile),
-      diagnosticPath: copiPaths.inputDiagnosticFile
+      diagnosticPath: copiPaths.inputDiagnosticFile,
+      modelPreference: initialModelPref
     })
     : new SharedBrowserClient({
       paths: copiPaths,
       sessionId,
+      modelPreference: initialModelPref,
       ...sharedBrowserOptions
     }));
+
+  modelController?.attachBrowser(activeBrowser);
 
   let sessionRef = null;
   const webUI = createWebUI(activeBrowser, {
@@ -163,6 +324,7 @@ export async function createRuntime({
     sessionId,
     profile,
     sessionLock,
+    modelController,
     getSessionMessageCount: () => sessionRef?.messages?.length ?? 0
   });
 
@@ -213,6 +375,14 @@ export async function createRuntime({
       });
     }
 
+    // In interactive mode, immediately open Edge in the background so the user can sign in right away
+    // and /model can read the live webpage options without waiting for the first prompt.
+    if (prewarmBrowser && typeof activeBrowser?.warm === 'function') {
+      void activeBrowser.warm({ wait: false, onStatus: webUI.onStatus }).catch(error => {
+        void logActivity(copiPaths, 'browser_warm_error', { sessionId, message: error?.message ?? String(error) });
+      });
+    }
+
     return {
       ...created,
       services, diagnostics: services.diagnostics
@@ -230,6 +400,7 @@ export async function runAgent({
   sessionManager,
   resumed = false,
   profile,
+  modelPreference,
   prompt,
   interactive,
   browser,
@@ -239,6 +410,15 @@ export async function runAgent({
   if (profile && copiPaths) {
     profileLock = await acquireProfileLock(copiPaths, profile);
   }
+
+  let initialPreference = modelPreference;
+  if (initialPreference === undefined && copiPaths) {
+    const config = await readConfig(copiPaths);
+    if (config.modelPreference !== undefined) {
+      try { initialPreference = parseModelPreference(config.modelPreference); } catch { /* ignore invalid saved value */ }
+    }
+  }
+  const modelController = createModelController({ copiPaths, initialPreference });
 
   let runtime;
   let mode;
@@ -250,6 +430,8 @@ export async function runAgent({
       browser,
       copiPaths,
       profile,
+      modelController,
+      prewarmBrowser: Boolean(interactive),
       sharedBrowserOptions
     });
     runtime = await createAgentSessionRuntime(factory, {
@@ -260,7 +442,10 @@ export async function runAgent({
     });
 
     if (interactive) {
-      mode = new CopiInteractiveMode(runtime, { initialMessage: prompt || undefined });
+      mode = new CopiInteractiveMode(runtime, {
+        initialMessage: prompt || undefined,
+        modelController
+      });
       await mode.run();
     } else {
       const session = runtime.session;

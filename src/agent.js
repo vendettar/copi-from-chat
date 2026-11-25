@@ -3,6 +3,7 @@ import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFile, stat } from 'node:fs/promises';
+import { parseModelPreference } from './model-preference.js';
 import { ensureCopiDirs, getCopiHome, getCopiPaths, normalizeCliPath, validateProfileName } from './paths.js';
 
 const PACKAGE_JSON = new URL('../package.json', import.meta.url);
@@ -11,17 +12,18 @@ const HELP = `Copi · Copilot from Chat
 
 Usage: copi [options] [prompt]
 
-  No prompt               Open the interactive editor (starts a new local session)
+  No prompt               Open the interactive editor and launch Edge for sign-in
   [prompt]                Start a task and stay in the interactive session
   -p, --print             Run one task and exit (also used without a terminal)
   -C, --cwd <dir>         Start in a project directory
   -c, --continue          Resume the most recent saved session for this project
   -s, --session <id>      Resume a saved session by ID or JSONL file path
+  -m, --model <target>    Web model preference: auto, quick, think, or 0-based menu index
   --profile <name>        Launch a separate isolated Edge window (~/.copi/browser-profiles/<name>)
   -v, --version           Show version
   -h, --help              Show this help
 
-Interactive commands: /new, /resume, /web, /quit
+Interactive commands: /model, /new, /resume, /web, /quit
 Enter submits; Shift+Enter adds a line; Esc stops the current task.
 Conversations are saved under ~/.copi/sessions. Multiple Git Bash windows share one Edge window with dedicated tabs.
 `;
@@ -36,6 +38,7 @@ try {
       cwd: { type: 'string', short: 'C' },
       continue: { type: 'boolean', short: 'c' },
       session: { type: 'string', short: 's' },
+      model: { type: 'string', short: 'm' },
       profile: { type: 'string' }
     }
   });
@@ -52,6 +55,7 @@ try {
     if (values.profile !== undefined) {
       validateProfileName(values.profile);
     }
+    const modelPreference = values.model !== undefined ? parseModelPreference(values.model) : undefined;
 
     const prompt = positionals.join(' ').trim();
     const interactive = !values.print && Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -93,6 +97,7 @@ try {
       sessionManager,
       resumed,
       profile: values.profile,
+      modelPreference,
       prompt,
       interactive
     });

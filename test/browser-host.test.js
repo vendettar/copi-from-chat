@@ -18,17 +18,36 @@ before(async () => {
 after(async () => { await engine?.close(); });
 
 function mockChatHtml() {
-  return `<!doctype html><html><body>
-    <button id="picker" aria-haspopup="menu">GPT-5.6 Sol Think deeper</button>
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+    <button id="picker" aria-haspopup="menu">自动</button>
+    <div id="menu" role="menu" style="min-width:10px;min-height:10px" hidden>
+      <div role="menuitemradio" aria-checked="true" data-i="0">自动</div>
+      <div role="menuitemradio" aria-checked="false" data-i="1">快速响应</div>
+      <div role="menuitemradio" aria-checked="false" data-i="2">深度思考</div>
+    </div>
     <div id="m365-chat-editor-target-element" contenteditable="true" data-lexical-editor="true"></div>
     <button id="send">Send</button>
     <button id="stop" data-testid="stop-button" hidden>Stop</button>
     <main id="replies"></main>
     <script>
+      const picker = document.getElementById('picker');
+      const menu = document.getElementById('menu');
       const composer = document.getElementById('m365-chat-editor-target-element');
       const stop = document.getElementById('stop');
       window.tabId = Math.random().toString(36).slice(2);
       window.sent = [];
+      window.selectedModel = '自动';
+      picker.onclick = () => { menu.hidden = !menu.hidden; };
+      for (const row of menu.querySelectorAll('[role="menuitemradio"]')) {
+        row.onclick = () => {
+          for (const r of menu.querySelectorAll('[role="menuitemradio"]')) r.setAttribute('aria-checked', 'false');
+          row.setAttribute('aria-checked', 'true');
+          window.selectedModel = row.textContent;
+          picker.textContent = row.textContent;
+          menu.hidden = true;
+        };
+      }
+      document.addEventListener('keydown', e => { if (e.key === 'Escape') menu.hidden = true; });
       document.getElementById('send').onclick = () => {
         const text = composer.innerText;
         window.sent.push(text);
@@ -40,7 +59,7 @@ function mockChatHtml() {
         reply.textContent = 'Working...';
         document.getElementById('replies').append(reply);
         setTimeout(() => {
-          reply.textContent = 'ECHO:' + text + '|TAB:' + window.tabId + '|COUNT:' + window.sent.length;
+          reply.textContent = 'ECHO:' + text + '|TAB:' + window.tabId + '|MODEL:' + window.selectedModel + '|COUNT:' + window.sent.length;
           reply.setAttribute('aria-busy', 'false');
           stop.hidden = true;
         }, 120);
@@ -79,7 +98,7 @@ test('Shared Browser Host isolates parallel sessions into dedicated tabs and reu
   const context = await engine.newContext();
   context.setDefaultTimeout(3000);
   await context.route('https://m365.cloud.microsoft/chat', route =>
-    route.fulfill({ contentType: 'text/html', body: mockChatHtml() })
+    route.fulfill({ contentType: 'text/html; charset=utf-8', body: mockChatHtml() })
   );
 
   const host = await startBrowserHost({ paths, context, sendConfirmTimeoutMs: 600, sendConfirmPollMs: 40 });
@@ -88,14 +107,24 @@ test('Shared Browser Host isolates parallel sessions into dedicated tabs and reu
   const clientA = new SharedBrowserClient({ paths, sessionId: 'session-alpha' });
   const clientB = new SharedBrowserClient({ paths, sessionId: 'session-beta' });
 
+  // Pre-warm Alpha ahead of chatting, inspect live models, and switch to quick via Browser Host!
+  const warmed = await clientA.warm({ wait: true });
+  assert.equal(warmed.ready, true);
+  const models = await clientA.listModels();
+  assert.equal(models.ready, true);
+  assert.deepEqual(models.models.map(m => m.label), ['自动', '快速响应', '深度思考']);
+  const switched = await clientA.setModelPreference('quick');
+  assert.equal(switched.applied, true);
+  assert.equal(switched.result.label, '快速响应');
+
   // Run two parallel sessions concurrently against the same shared Browser Host.
   const [replyA1, replyB1] = await Promise.all([
     clientA.ask('Hello from Alpha', { fresh: true }),
     clientB.ask('Hello from Beta', { fresh: true })
   ]);
 
-  assert.match(replyA1.text, /^ECHO:Hello from Alpha\|TAB:([^|]+)\|COUNT:1$/);
-  assert.match(replyB1.text, /^ECHO:Hello from Beta\|TAB:([^|]+)\|COUNT:1$/);
+  assert.match(replyA1.text, /^ECHO:Hello from Alpha\|TAB:([^|]+)\|MODEL:快速响应\|COUNT:1$/);
+  assert.match(replyB1.text, /^ECHO:Hello from Beta\|TAB:([^|]+)\|MODEL:深度思考\|COUNT:1$/);
   const tabA = replyA1.text.match(/TAB:([^|]+)/)[1];
   const tabB = replyB1.text.match(/TAB:([^|]+)/)[1];
   assert.notEqual(tabA, tabB, 'Parallel sessions must use distinct tabs in the shared window');
@@ -106,17 +135,17 @@ test('Shared Browser Host isolates parallel sessions into dedicated tabs and reu
   await clientA.close({ closeTab: false });
 
   // Resuming Alpha in a brand-new SharedBrowserClient reuses its existing tab and retrieves the anchor!
-  const resumedA = new SharedBrowserClient({ paths, sessionId: 'session-alpha' });
+  const resumedA = new SharedBrowserClient({ paths, sessionId: 'session-alpha', modelPreference: 'quick' });
   const cont = await resumedA.getContinuationState('session-alpha');
   assert.equal(cont.hasContinuation, true);
   assert.deepEqual(cont.lastTurn, anchor);
 
   const replyA2 = await resumedA.ask('Follow-up in Alpha', { fresh: false, requireContinuation: true });
-  assert.match(replyA2.text, new RegExp(`^ECHO:Follow-up in Alpha\\|TAB:${tabA}\\|COUNT:2$`));
+  assert.match(replyA2.text, new RegExp(`^ECHO:Follow-up in Alpha\\|TAB:${tabA}\\|MODEL:快速响应\\|COUNT:2$`));
 
   // Beta continues cleanly on its own tab without disturbance.
   const replyB2 = await clientB.ask('Follow-up in Beta', { fresh: false, requireContinuation: true });
-  assert.match(replyB2.text, new RegExp(`^ECHO:Follow-up in Beta\\|TAB:${tabB}\\|COUNT:2$`));
+  assert.match(replyB2.text, new RegExp(`^ECHO:Follow-up in Beta\\|TAB:${tabB}\\|MODEL:深度思考\\|COUNT:2$`));
 
   // Shutting down the Browser Host causes requireContinuation to fail with proven pre-Send COPILOT_CONTEXT_LOST.
   await host.shutdown('test');

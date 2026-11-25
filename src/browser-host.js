@@ -56,7 +56,7 @@ export async function startBrowserHost({
   channel = process.platform === 'win32' ? 'msedge' : 'chrome',
   headless = false,
   context: injectedContext = null,
-  version = '0.0.7',
+  version = '0.0.8',
   sendConfirmTimeoutMs,
   sendConfirmPollMs,
   composerTimeoutMs,
@@ -197,11 +197,57 @@ export async function startBrowserHost({
         return;
       }
 
-      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach)$/.exec(pathname);
+      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach|warm|models|model)$/.exec(pathname);
       if (!match) return sendJson(res, 404, { error: 'Not found' });
 
       const sessionId = decodeURIComponent(match[1]);
       const action = match[2];
+
+      if (req.method === 'POST' && action === 'warm') {
+        const body = await readJsonBody(req);
+        const { entry } = getOrCreateSession(sessionId);
+        entry.lastActiveAt = Date.now();
+        if (body.modelPreference !== undefined) {
+          await entry.tab.setModelPreference(body.modelPreference, { applyNow: false });
+        }
+        const pending = entry.tab.warm({});
+        if (body.wait) {
+          const result = await pending;
+          return sendJson(res, 200, { ok: true, ...result });
+        }
+        pending.catch(() => {});
+        return sendJson(res, 200, { ok: true, ready: await entry.tab.isReady(), warming: true });
+      }
+
+      if (req.method === 'GET' && action === 'models') {
+        const openIfNeeded = url.searchParams.get('open') === '1';
+        let entry = sessions.get(sessionId);
+        if (!entry) {
+          if (!openIfNeeded) {
+            return sendJson(res, 200, { ready: false, current: null, models: [], reason: 'not_open' });
+          }
+          entry = getOrCreateSession(sessionId).entry;
+        }
+        entry.lastActiveAt = Date.now();
+        const result = await entry.tab.listModels({ openIfNeeded });
+        return sendJson(res, 200, { ...result, preference: entry.tab.modelPreference });
+      }
+
+      if (req.method === 'POST' && action === 'model') {
+        const body = await readJsonBody(req);
+        const { entry } = getOrCreateSession(sessionId);
+        entry.lastActiveAt = Date.now();
+        const result = await entry.tab.setModelPreference(body.preference, {
+          applyNow: body.applyNow !== false
+        });
+        await logActivity(paths, 'model_change', {
+          sessionId,
+          preference: result.preference,
+          applied: result.applied,
+          selectedLabel: result.result?.label ?? null
+        });
+        return sendJson(res, 200, { ok: true, ...result });
+      }
 
       if (req.method === 'POST' && action === 'attach') {
         const { entry, reused } = getOrCreateSession(sessionId);
@@ -296,6 +342,7 @@ export async function startBrowserHost({
             signal: controller.signal,
             fresh: Boolean(body.fresh),
             requireContinuation: Boolean(body.requireContinuation),
+            ...(body.modelPreference !== undefined ? { modelPreference: body.modelPreference } : {}),
             onStatus: message => writeEvent({ type: 'status', message }),
             onSnapshot: snapshot => writeEvent({ type: 'snapshot', snapshot }),
             onEvent: detail => {

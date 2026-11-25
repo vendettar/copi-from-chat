@@ -385,3 +385,46 @@ test('ambiguous page changes after Send are never clicked a second time', async 
   assert.equal(await browser.page.evaluate(() => window.sendClicks), 1);
   assert.equal(browser.uncertain, true);
 });
+
+test('listModels reads live Chinese options and setModelPreference switches auto, quick, think, and index', async t => {
+  const browser = await fixture(t, {
+    items: [
+      { label: '自动', desc: '决定要思考多长时间' },
+      { label: '快速响应', desc: '立即回答' },
+      { label: '深度思考', desc: '思考更长的时间以获得更好的回答' }
+    ]
+  });
+  if (!browser) return;
+
+  const live = await browser.listModels();
+  assert.equal(live.ready, true);
+  assert.equal(live.current, '自动');
+  assert.deepEqual(live.models.map(m => [m.index, m.label, m.selected]), [
+    [0, '自动', true],
+    [1, '快速响应', false],
+    [2, '深度思考', false]
+  ]);
+  assert.equal(await browser.page.getByRole('menu').count(), 0);
+
+  const quick = await browser.setModelPreference('quick');
+  assert.equal(quick.applied, true);
+  assert.equal(quick.result.index, 1);
+  assert.equal(quick.result.label, '快速响应');
+
+  assert.equal((await browser.ask('Fast turn.', { fresh: true })).completed, true);
+  assert.deepEqual(await browser.page.evaluate(() => window.sent), [{ text: 'Fast turn.', selected: '快速响应' }]);
+
+  // Switching mid-conversation applies on the live tab and persists for the next turn.
+  const auto = await browser.setModelPreference('auto');
+  assert.equal(auto.applied, true);
+  assert.equal(auto.result.index, 0);
+  assert.equal(auto.result.label, '自动');
+
+  assert.equal((await browser.ask('Auto turn.', { requireContinuation: true })).completed, true);
+  assert.equal((await browser.page.evaluate(() => window.sent))[1].selected, '自动');
+
+  // Explicit numeric index switches to 深度思考 (index 2).
+  const idx2 = await browser.setModelPreference(2);
+  assert.equal(idx2.applied, true);
+  assert.equal(idx2.result.label, '深度思考');
+});

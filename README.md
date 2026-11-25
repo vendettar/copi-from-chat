@@ -25,12 +25,18 @@ copi --help
 ```bash
 copi -C C:/path/to/project
 copi -C C:/path/to/project "inspect this project"
+copi -C C:/path/to/project --model quick
 copi -p -C C:/path/to/project "run the tests"
 ```
 
-On first use, sign in to Microsoft 365 in the Edge window.
+Launching `copi` in interactive mode immediately opens the shared Edge window in the background so you can sign in to Microsoft 365 right away without waiting for your first message.
 
-Model selection uses index-based fallback (`last -> second-to-last -> first`) instead of hardcoded model names, so it stays compatible across Chinese/English M365 menus (such as `自动 / 快速响应 / 深度思考` or `Auto / Quick response / Think deeper`) and future model renames, falling back gracefully to the active/Auto model without failing the turn.
+### Model selection (`/model` and `--model`)
+
+Model selection uses pure positional indices instead of hardcoded model names, so it stays compatible across Chinese/English M365 menus (such as `自动 / 快速响应 / 深度思考` or `Auto / Quick response / Think deeper`) and future model renames, falling back gracefully to the active/Auto model without failing the turn.
+
+- `/model`: reads the live model options from the open Edge tab and lets you choose interactively (or shows presets if Edge is still signing in).
+- `/model auto` / `/model quick` / `/model think` / `/model <index>` (or CLI `-m, --model <target>`): switches immediately when Edge is ready and saves your default preference under `~/.copi/config.json`.
 
 ## Resume conversations
 
@@ -63,9 +69,10 @@ The shared login state is stored under `~/.copi/shared-browser-profile`. `--prof
 
 ## Interactive commands
 
+- `/model [auto|quick|think|<index>]`: read live models from Edge or switch model preference
 - `/new`: new conversation
 - `/resume`: select a saved conversation
-- `/web`: show workspace and tools
+- `/web`: show workspace, browser mode, model preference, and tools
 - `/quit`: exit
 
 ## Local data
@@ -73,6 +80,7 @@ The shared login state is stored under `~/.copi/shared-browser-profile`. `--prof
 - `sessions`: persisted Pi conversations
 - `shared-browser-profile`: login state for the shared Edge window
 - `browser-profiles`: optional isolated profiles used with `--profile`
+- `config.json`: saved user preferences (such as default web model preference)
 - `activity.jsonl`: lifecycle events
 - `checkpoints`: tool-execution checkpoints
 - `locks`: session, startup, and optional profile ownership locks
@@ -92,10 +100,10 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.0.7.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.0.8.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.0.7.tgz
+npm install -g ./copi-from-chat-0.0.8.tgz
 copi --help
 ```
 

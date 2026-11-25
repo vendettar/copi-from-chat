@@ -3,6 +3,7 @@ import { readFile, unlink } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { getCopiPaths } from './paths.js';
+import { DEFAULT_MODEL_PREFERENCE, parseModelPreference } from './model-preference.js';
 import { isPidAlive, logActivity, withStartupLock } from './storage.js';
 
 const HOST_SCRIPT = fileURLToPath(new URL('./browser-host.js', import.meta.url));
@@ -106,16 +107,19 @@ export class SharedBrowserClient {
   mode = 'shared';
   busy = false;
   uncertain = false;
+  lastSelectedModel = null;
 
   constructor({
     paths = getCopiPaths(),
     sessionId,
+    modelPreference = DEFAULT_MODEL_PREFERENCE,
     spawnHost,
     startupTimeoutMs = STARTUP_TIMEOUT_MS
   }) {
     if (!sessionId) throw new Error('SharedBrowserClient requires a sessionId.');
     this.paths = paths;
     this.sessionId = sessionId;
+    this.modelPreference = parseModelPreference(modelPreference);
     this.spawnHost = spawnHost;
     this.startupTimeoutMs = startupTimeoutMs;
     this.hostInfo = null;
@@ -187,7 +191,46 @@ export class SharedBrowserClient {
     return Boolean(state?.hasContinuation);
   }
 
-  async ask(message, { signal, fresh = false, requireContinuation = false, onSnapshot = () => {}, onStatus = () => {} } = {}) {
+  async warm({ wait = false, signal } = {}) {
+    const info = await this._connect({ startIfMissing: true, signal });
+    if (!this.attached) await this.attach({ signal });
+    const response = await this._request(info, 'POST', `/sessions/${encodeURIComponent(this.sessionId)}/warm`, {
+      wait: Boolean(wait),
+      modelPreference: this.modelPreference
+    }, { signal });
+    return response.json();
+  }
+
+  async listModels({ openIfNeeded = false, signal } = {}) {
+    const info = await this._connect({ startIfMissing: openIfNeeded, signal });
+    if (!info) return { ready: false, current: this.lastSelectedModel, models: [], reason: 'not_open' };
+    if (openIfNeeded && !this.attached) await this.attach({ signal });
+    const query = openIfNeeded ? '?open=1' : '';
+    const response = await this._request(info, 'GET', `/sessions/${encodeURIComponent(this.sessionId)}/models${query}`, undefined, { signal });
+    const data = await response.json();
+    if (data?.current) this.lastSelectedModel = data.current;
+    return data;
+  }
+
+  async setModelPreference(preference, { applyNow = true, signal } = {}) {
+    const parsed = parseModelPreference(preference);
+    this.modelPreference = parsed;
+    const info = await this._connect({ startIfMissing: false, signal });
+    if (!info) return { preference: parsed, applied: false, reason: 'not_open' };
+    try {
+      const response = await this._request(info, 'POST', `/sessions/${encodeURIComponent(this.sessionId)}/model`, {
+        preference: parsed,
+        applyNow
+      }, { signal });
+      const data = await response.json();
+      if (data?.result?.label) this.lastSelectedModel = data.result.label;
+      return data;
+    } catch {
+      return { preference: parsed, applied: false, reason: 'host_unreachable' };
+    }
+  }
+
+  async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, onSnapshot = () => {}, onStatus = () => {} } = {}) {
     if (this.busy) {
       throw Object.assign(new Error('A browser request is already in progress.'), { beforeSend: true });
     }
@@ -228,7 +271,12 @@ export class SharedBrowserClient {
           authorization: `Bearer ${info.token}`,
           'content-type': 'application/json'
         },
-        body: JSON.stringify({ message, fresh, requireContinuation }),
+        body: JSON.stringify({
+          message,
+          fresh,
+          requireContinuation,
+          modelPreference: modelPreference !== undefined ? parseModelPreference(modelPreference) : this.modelPreference
+        }),
         signal: controller.signal
       });
       if (!response.ok || !response.body) {
