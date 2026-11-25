@@ -1,18 +1,25 @@
 {
-  "name": "copilot-from-chat-poc",
-  "version": "0.1.0",
-  "private": true,
+  "name": "copi-from-chat",
+  "version": "0.0.7",
   "type": "module",
-  "description": "Local coding agent powered by Microsoft 365 Chat in Edge and Pi.",
+  "description": "Windows coding-agent CLI using Microsoft 365 Copilot in Edge as the model transport and Pi as the local agent runtime.",
   "bin": {
-    "copilot": "src/agent.js"
+    "copi": "src/agent.js"
   },
+  "files": [
+    "src/**/*.js",
+    "licenses/**",
+    "README.md",
+    "ROADMAP.md",
+    "UPGRADE-SUMMARY.md"
+  ],
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=20.0.0"
   },
   "scripts": {
     "start": "node src/agent.js",
     "browser": "node src/index.js",
+    "check": "node src/check.js",
     "test": "node --test"
   },
   "dependencies": {
@@ -20,5 +27,11 @@
     "@earendil-works/pi-coding-agent": "1.5.0",
     "@earendil-works/pi-tui": "1.5.0",
     "playwright-core": "1.63.0"
-  }
+  },
+  "bundleDependencies": [
+    "@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-tui",
+    "playwright-core"
+  ]
 }

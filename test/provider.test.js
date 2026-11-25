@@ -182,9 +182,35 @@ test('duplicate and empty continuations stay blocked without losing the last val
   assert.equal(h.requests[1].request.mode, 'continue');
 });
 
-test('a lost web conversation stops without replaying old history, including later retries', async () => {
+test('a lost web conversation proven before Send recovers once in a fresh web conversation', async () => {
   const h = harness((request, count) => {
-    if (count === 2) throw Object.assign(new Error('No active conversation; nothing entered.'), { code: 'COPILOT_CONTEXT_LOST' });
+    if (count === 2) {
+      throw Object.assign(new Error('No active conversation; nothing entered.'), {
+        code: 'COPILOT_CONTEXT_LOST', beforeSend: true, retryableInFreshChat: true
+      });
+    }
+    return reply(request);
+  });
+  const first = await h.run();
+  const context = { ...base, messages: [...base.messages, first, user('Continue.')] };
+  const second = await h.run(context);
+  assert.equal(second.stopReason, 'stop');
+  assert.deepEqual(h.requests.map(({ request, options }) => [request.mode, options.fresh]), [
+    ['bootstrap', true],
+    ['continue', false],
+    ['bootstrap', true]
+  ]);
+  assert.equal(h.requests[2].request.resumed, true);
+  // Subsequent turns continue sending only deltas on the recovered fresh chat.
+  const third = await h.run({ ...base, messages: [...context.messages, second, user('Next.')] });
+  assert.equal(third.stopReason, 'stop');
+  assert.equal(h.requests[3].request.mode, 'continue');
+  assert.deepEqual(h.requests[3].request.messages.map(textOf), ['Next.']);
+});
+
+test('a lost web conversation without beforeSend proof stops without replaying old history', async () => {
+  const h = harness((request, count) => {
+    if (count === 2) throw Object.assign(new Error('No active conversation; state uncertain.'), { code: 'COPILOT_CONTEXT_LOST' });
     return reply(request);
   });
   const first = await h.run();
@@ -210,6 +236,67 @@ test('an uncertain send is never automatically replayed', async () => {
   assert.match(result.errorMessage, /Use \/new/);
   await h.run();
   assert.equal(h.requests.length, 2);
+});
+
+test('a resumed session with >12 messages sends proactive compacted bootstrap while reusing live tabs when available', async () => {
+  // Build a 14-message local history.
+  const messages = [];
+  for (let i = 0; i < 7; i++) {
+    messages.push(user(`User turn ${i}: keep this instruction intact.`));
+    messages.push({ role: 'assistant', content: [{ type: 'text', text: `Assistant decision ${i}.` }], timestamp: i + 1 });
+  }
+  messages.push(user('Final resumed instruction.'));
+
+  // Case 1: Fresh tab bootstrap compacts proactively (>12 messages).
+  const h = harness();
+  const resumed = await h.run({ ...base, messages }, { sessionId: 'sess-compact' });
+  assert.equal(resumed.stopReason, 'stop');
+  assert.equal(h.requests[0].request.mode, 'bootstrap');
+  assert.equal(h.requests[0].request.resumed, true);
+  assert.equal(h.requests[0].request.compacted, true);
+  assert.ok(h.requests[0].request.messages.length < messages.length);
+  assert.equal(textOf(h.requests[0].request.messages[0]), 'User turn 0: keep this instruction intact.');
+  assert.equal(textOf(h.requests[0].request.messages.at(-1)), 'Final resumed instruction.');
+  // Next turn still sends only the delta because lastTurn anchored to the unmodified full history.
+  const next = await h.run({ ...base, messages: [...messages, resumed, user('Delta turn.')] }, { sessionId: 'sess-compact' });
+  assert.equal(next.stopReason, 'stop');
+  assert.equal(h.requests[1].request.mode, 'continue');
+  assert.deepEqual(h.requests[1].request.messages.map(textOf), ['Delta turn.']);
+
+  // Case 2: Live Browser Host tab continuation skips bootstrap and continues directly.
+  let storedTurn = null;
+  const liveRequests = [];
+  const sharedBrowser = {
+    async getContinuationState(sessionId) {
+      return storedTurn && storedTurn.sessionId === sessionId
+        ? { hasContinuation: true, lastTurn: storedTurn }
+        : { hasContinuation: false, lastTurn: null };
+    },
+    async saveTurnState(_sessionId, turn) { storedTurn = turn; },
+    async ask(prompt, options) {
+      const request = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+      liveRequests.push({ request, options });
+      return reply(request);
+    }
+  };
+  const provider1 = createCopilotProvider(sharedBrowser);
+  const s1 = provider1.streamSimple(provider1.getModels()[0], normalizeContext(base), { sessionId: 'live-sess' });
+  for await (const _ of s1) {}
+  const r1 = await s1.result();
+
+  // Brand-new provider instance (simulating a resumed CLI process while Browser Host stays running).
+  const provider2 = createCopilotProvider(sharedBrowser);
+  const s2 = provider2.streamSimple(
+    provider2.getModels()[0],
+    normalizeContext({ ...base, messages: [...base.messages, r1, user('Resumed on live tab.')] }),
+    { sessionId: 'live-sess' }
+  );
+  for await (const _ of s2) {}
+  const r2 = await s2.result();
+  assert.equal(r2.stopReason, 'stop');
+  assert.equal(liveRequests[1].request.mode, 'continue');
+  assert.equal(liveRequests[1].options.fresh, false);
+  assert.deepEqual(liveRequests[1].request.messages.map(textOf), ['Resumed on live tab.']);
 });
 
 test('large user input is preserved without an invented browser or conversation limit', async () => {

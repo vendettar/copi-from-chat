@@ -6,7 +6,8 @@ import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAgentSessionRuntime, SessionManager } from '@earendil-works/pi-coding-agent';
-import { createRuntime } from '../src/runtime.js';
+import { createRuntime, resolveSessionManager } from '../src/runtime.js';
+import { ensureCopiDirs, getCopiPaths } from '../src/paths.js';
 
 process.env.PI_OFFLINE = '1';
 const packet = (request, value) => {
@@ -102,7 +103,8 @@ test('large read results use a saved preview; the next user turn sends only new 
   await runtime.session.prompt('Continue using what you just read.');
   assert.equal(runtime.session.getLastAssistantText(), 'File inspected.');
   const browser = browsers[0];
-  assert.ok(JSON.stringify({ ...browser.context, messages: browser.history }).length > 24000);
+  assert.ok(original.length > 18000);
+  assert.ok(JSON.stringify([{ type: 'text', text: preview }]).length <= 5000);
   assert.deepEqual(browser.calls.map(call => call.request.mode), ['bootstrap', 'continue', 'continue']);
   assert.ok(browser.calls.at(-1).length < 4000);
   assert.equal(browser.calls.at(-1).request.messages.length, 1);
@@ -227,4 +229,139 @@ test('abort never replays the interrupted conversation; /new starts a clean task
   assert.equal(runtime.session.getLastAssistantText(), 'Done.');
   assert.equal(browsers[1].calls.length, 1);
   assert.deepEqual(browsers[1].calls[0].request.messages.map(m => m.content[0].text), ['A clean task.']);
+});
+
+test('persisted sessions save JSONL under ~/.copi/sessions, resume with proactive compaction, and keep transcript unmodified', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'copi-resume-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const copiHome = join(root, 'copi-home');
+  await mkdir(cwd);
+  const copiPaths = await ensureCopiDirs(getCopiPaths(copiHome));
+  const sessionDir = join(copiPaths.sessionsDir, 'test-project');
+
+  const browsers = [];
+  const makeBrowser = () => {
+    const browser = {
+      calls: [], closes: 0,
+      async ask(prompt, options) {
+        const request = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+        this.calls.push({ request, fresh: options.fresh });
+        const lastMsg = request.messages.at(-1);
+        const lastText = typeof lastMsg?.content === 'string'
+          ? lastMsg.content
+          : lastMsg?.content?.map(b => b.text ?? '').join('') ?? '';
+        if (lastMsg?.role === 'user' && lastText.includes('Write checkpoint file')) {
+          return call(request, 'write', { path: 'checked.txt', content: 'ok\n' });
+        }
+        return final(request, `Reply ${this.calls.length}.`);
+      },
+      async close() { this.closes++; }
+    };
+    browsers.push(browser);
+    return browser;
+  };
+
+  // Start a persisted session and build >12 messages so resume triggers proactive compaction.
+  const initialManager = SessionManager.create(cwd, sessionDir);
+  const runtime1 = await createAgentSessionRuntime(
+    options => createRuntime({ ...options, browser: makeBrowser(), copiPaths }),
+    { cwd, agentDir: copiHome, sessionManager: initialManager }
+  );
+  runtime1.setRebindSession(session => session.bindExtensions({}));
+  await runtime1.session.bindExtensions({});
+
+  await runtime1.session.prompt('Write checkpoint file.');
+  for (let i = 1; i <= 6; i++) {
+    await runtime1.session.prompt(`Follow-up turn ${i} that must stay verbatim.`);
+  }
+  const sessionId = runtime1.session.sessionManager.getSessionId();
+  const sessionFile = runtime1.session.sessionFile;
+  assert.ok(sessionFile);
+  assert.ok(runtime1.session.messages.length > 12);
+  const transcriptBeforeResume = await readFile(sessionFile, 'utf8');
+
+  // While runtime1 holds the session lock, a second runtime attempting the same sessionId must be rejected.
+  const duplicateManager = SessionManager.open(sessionFile, sessionDir);
+  await assert.rejects(
+    createRuntime({ cwd, agentDir: copiHome, sessionManager: duplicateManager, browser: makeBrowser(), copiPaths }),
+    { code: 'COPI_LOCKED' }
+  );
+
+  await runtime1.dispose();
+
+  // Verify checkpoints and activity log were written.
+  const checkpointFile = join(copiPaths.checkpointsDir, `${sessionId}.jsonl`);
+  const checkpoints = (await readFile(checkpointFile, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.ok(checkpoints.some(c => c.toolName === 'write' && c.phase === 'started'));
+  assert.ok(checkpoints.some(c => c.toolName === 'write' && c.phase === 'completed'));
+  const activity = (await readFile(copiPaths.activityLog, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+  assert.ok(activity.some(a => a.event === 'session_start'));
+  assert.ok(activity.some(a => a.event === 'session_end'));
+
+  // Resume via resolveSessionManager (--continue and --session prefix).
+  const byContinue = await resolveSessionManager({ cwd, continueRecent: true, sessionDir });
+  assert.equal(byContinue.resumed, true);
+  assert.equal(byContinue.sessionManager.getSessionId(), sessionId);
+
+  const byPrefix = await resolveSessionManager({ cwd, sessionId: sessionId.slice(0, 8), sessionDir });
+  assert.equal(byPrefix.resumed, true);
+  assert.equal(byPrefix.sessionManager.getSessionId(), sessionId);
+
+  const resumedBrowser = makeBrowser();
+  const runtime2 = await createAgentSessionRuntime(
+    options => createRuntime({ ...options, browser: resumedBrowser, copiPaths }),
+    { cwd, agentDir: copiHome, sessionManager: byPrefix.sessionManager }
+  );
+  runtime2.setRebindSession(session => session.bindExtensions({}));
+  await runtime2.session.bindExtensions({});
+  t.after(() => runtime2.dispose());
+
+  await runtime2.session.prompt('Continue after resume.');
+  assert.equal(resumedBrowser.calls.length, 1);
+  assert.equal(resumedBrowser.calls[0].fresh, true);
+  assert.equal(resumedBrowser.calls[0].request.mode, 'bootstrap');
+  assert.equal(resumedBrowser.calls[0].request.resumed, true);
+  assert.equal(resumedBrowser.calls[0].request.compacted, true);
+  assert.ok(resumedBrowser.calls[0].request.messages.length < runtime2.session.messages.length);
+
+  // Saved JSONL transcript only appended the new turn; all earlier lines remain unmodified!
+  const transcriptAfterResume = await readFile(sessionFile, 'utf8');
+  assert.ok(transcriptAfterResume.startsWith(transcriptBeforeResume));
+
+  // Verify interactive /resume (runtime.switchSession) switches to another saved session and releases/reacquires locks.
+  const secondManager = SessionManager.create(cwd, sessionDir);
+  const runtime3 = await createAgentSessionRuntime(
+    options => createRuntime({ ...options, browser: makeBrowser(), copiPaths }),
+    { cwd, agentDir: copiHome, sessionManager: secondManager }
+  );
+  runtime3.setRebindSession(session => session.bindExtensions({}));
+  await runtime3.session.bindExtensions({});
+  t.after(() => runtime3.dispose());
+  await runtime3.session.prompt('Second session prompt.');
+  const secondSessionFile = runtime3.session.sessionFile;
+  assert.ok(secondSessionFile);
+
+  // Switching runtime2 to secondSessionFile while runtime3 holds its lock is cancelled cleanly.
+  const cancelledSwitch = await runtime2.switchSession(secondSessionFile);
+  assert.equal(cancelledSwitch.cancelled, true);
+
+  // After runtime3 disposes, runtime2 can switchSession cleanly.
+  await runtime3.dispose();
+  const okSwitch = await runtime2.switchSession(secondSessionFile);
+  assert.equal(okSwitch.cancelled, false);
+  assert.equal(runtime2.session.sessionFile, secondSessionFile);
+});
+
+test('copi CLI --help and --version print standalone metadata', async () => {
+  const exec = promisify(execFile);
+  const { stdout: helpOut } = await exec(process.execPath, ['src/agent.js', '--help']);
+  assert.match(helpOut, /Usage: copi \[options\] \[prompt\]/);
+  assert.match(helpOut, /--continue/);
+  assert.match(helpOut, /--session <id>/);
+  assert.match(helpOut, /--profile <name>/);
+  assert.match(helpOut, /\/resume/);
+
+  const { stdout: versionOut } = await exec(process.execPath, ['src/agent.js', '--version']);
+  assert.match(versionOut.trim(), /^\d+\.\d+\.\d+$/);
 });

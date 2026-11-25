@@ -3,15 +3,15 @@ import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// This is a soft budget for NEW tool-result text, not a browser input or conversation limit.
-// Pi's usual 50 KiB output cap can exceed it even once, especially after JSON escapes double in size.
-const TOOL_TEXT_BUDGET = 18000;
+// Proactive soft budgets for outgoing tool-result batches (~10,000 JSON chars total, ~5,000 per result).
+// User instructions are never shortened; full tool output is always saved locally when shortened.
+export const TOOL_TEXT_BUDGET = 10000;
+export const PER_RESULT_TOOL_TEXT_BUDGET = 5000;
 const size = content => JSON.stringify(content).length;
 
 async function saveOutput(text, signal) {
-  const path = join(tmpdir(), `copilot-output-${randomUUID()}.txt`);
+  const path = join(tmpdir(), `copi-output-${randomUUID()}.txt`);
   await writeFile(path, text, { encoding: 'utf8', flag: 'wx', mode: 0o600, signal });
-  // Ordinary temporary tool output, like Pi's saved command logs; no history index or session recovery.
   return path.replaceAll('\\', '/');
 }
 
@@ -29,33 +29,36 @@ function preview(text, path, budget) {
     if (size(candidate) <= budget) { best = candidate; low = middle + 1; }
     else high = middle - 1;
   }
-  // Both ends preserve useful context and command failure/status lines. The original returned text is saved
-  // unchanged; if Pi had already shortened it, its original continuation/full-log notice is saved as well.
   return best;
 }
 
-export async function limitToolResults(messages, { signal, save = saveOutput } = {}) {
+export async function limitToolResults(messages, {
+  signal,
+  save = saveOutput,
+  batchBudget = TOOL_TEXT_BUDGET,
+  perResultBudget = PER_RESULT_TOOL_TEXT_BUDGET
+} = {}) {
   signal?.throwIfAborted();
   const results = messages.map((message, index) => ({ message, index }))
     .filter(({ message }) => message.role === 'toolResult');
-  if (results.reduce((sum, { message }) => sum + size(message.content), 0) <= TOOL_TEXT_BUDGET) return messages;
+  const totalSize = results.reduce((sum, { message }) => sum + size(message.content), 0);
+  const anyOversized = results.some(({ message }) => size(message.content) > perResultBudget);
+  if (totalSize <= batchBudget && !anyOversized) return messages;
 
   const limited = [...messages];
-  let remaining = TOOL_TEXT_BUDGET, count = results.length;
-  // Small results stay whole; large results share the remaining budget across this batch, not per tool.
+  let remaining = batchBudget, count = results.length;
+  // Small results stay whole; large results share the remaining batch budget and obey the per-result cap.
   for (const { message, index } of results.sort((a, b) => size(a.message.content) - size(b.message.content))) {
     signal?.throwIfAborted();
-    // Every result must retain a readable continuation note. Very large batches can exceed this soft
-    // target through their notes/metadata; that still must not become a fabricated browser input limit.
-    const share = Math.max(512, Math.floor(remaining / count--));
+    const fairShare = Math.max(512, Math.floor(remaining / count--));
+    const share = Math.min(perResultBudget, fairShare);
     let content = message.content;
     if (size(content) > share) {
       const text = typeof content === 'string' ? content : content.map(block => block.text).join('\n\n');
       const path = await save(text, signal);
       signal?.throwIfAborted();
       content = preview(text, path, share);
-      // Change only the transport copy. Keep tool IDs, errors and the local transcript intact, so subsequent
-      // delta comparisons still use the real Pi history. Never repeat the command to recover omitted output.
+      // Change only the transport copy. Keep tool IDs, errors and the local transcript intact.
       limited[index] = { ...message, content };
     }
     remaining -= size(content);

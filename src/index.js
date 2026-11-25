@@ -1,6 +1,11 @@
 import { CopilotBrowser } from './browser.js';
+import { ensureCopiDirs, getCopiPaths } from './paths.js';
 
-const browser = new CopilotBrowser();
+const paths = await ensureCopiDirs(getCopiPaths());
+const browser = new CopilotBrowser({
+  profileDir: paths.sharedProfileDir,
+  diagnosticPath: paths.inputDiagnosticFile
+});
 let lastText = '', previewActive = false;
 const report = text => {
   if (previewActive && !lastText.endsWith('\n')) process.stdout.write('\n');
@@ -10,7 +15,7 @@ const report = text => {
 
 try {
   if (process.argv.length > 2) {
-    throw new Error('This command only checks browser connectivity. Use copilot to open the coding agent.');
+    throw new Error('This command only checks browser connectivity. Use copi to open the coding agent.');
   }
   await browser.ask('Reply exactly: Browser connection successful.', {
     onStatus: report,
