@@ -221,12 +221,31 @@ export async function readConfig(paths) {
   }
 }
 
+const TRANSIENT_RENAME_ERRORS = new Set(['EPERM', 'EBUSY', 'EACCES']);
+
+export async function writeFileAtomic(filePath, content, { mode = 0o600, maxAttempts = 4 } = {}) {
+  await mkdir(dirname(filePath), { recursive: true });
+  const temp = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  await writeFile(temp, content, { encoding: 'utf8', mode });
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        await rename(temp, filePath);
+        return;
+      } catch (error) {
+        if (!TRANSIENT_RENAME_ERRORS.has(error?.code) || attempt === maxAttempts - 1) throw error;
+        await delay(15 * (attempt + 1));
+      }
+    }
+  } catch (error) {
+    await unlink(temp).catch(() => {});
+    throw error;
+  }
+}
+
 export async function saveConfig(paths, patch = {}) {
   if (!paths?.configFile) return {};
   const next = { ...(await readConfig(paths)), ...patch };
-  await mkdir(dirname(paths.configFile), { recursive: true });
-  const temp = `${paths.configFile}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  await rename(temp, paths.configFile);
+  await writeFileAtomic(paths.configFile, `${JSON.stringify(next, null, 2)}\n`);
   return next;
 }

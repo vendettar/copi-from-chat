@@ -1,6 +1,5 @@
-import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { writeFileAtomic } from './storage.js';
 
 const DAILY_LIMIT_PATTERNS = [
   /\b(?:daily|message|usage|rate)\s+limit\b/i,
@@ -75,10 +74,7 @@ export async function readTodayQuota(paths, now = new Date()) {
 
 async function writeQuota(paths, record) {
   if (!paths?.quotaFile) return record;
-  await mkdir(dirname(paths.quotaFile), { recursive: true });
-  const temp = `${paths.quotaFile}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  await writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  await rename(temp, paths.quotaFile);
+  await writeFileAtomic(paths.quotaFile, `${JSON.stringify(record, null, 2)}\n`);
   return record;
 }
 

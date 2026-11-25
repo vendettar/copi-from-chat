@@ -134,14 +134,24 @@ function formatShortTime(timestamp) {
 }
 
 const DISPLAY_PRELOAD_BLOCK = /\n\n\[Preloaded @?file context — [^\]]+\]\n([\s\S]*)$/;
+const DISPLAY_DIFF_BLOCK = /\n\nGit diff:\n```diff\n([\s\S]*?)\n```$/;
 
 function collapsePreloadForDisplay(markdown) {
-  const match = DISPLAY_PRELOAD_BLOCK.exec(markdown);
-  if (!match) return markdown;
-  const userText = markdown.slice(0, match.index);
-  const files = [...match[1].matchAll(/^--- @?(.+?) ---$/gm)].map(m => m[1].trim()).filter(Boolean);
-  if (!files.length) return userText;
-  return `${userText}\n\n> Preloaded locally: ${files.map(f => `\`${f}\``).join(', ')}`;
+  let out = markdown;
+  const preload = DISPLAY_PRELOAD_BLOCK.exec(out);
+  if (preload) {
+    const userText = out.slice(0, preload.index);
+    const files = [...preload[1].matchAll(/^--- @?(.+?) ---$/gm)].map(m => m[1].trim()).filter(Boolean);
+    out = files.length
+      ? `${userText}\n\n> Preloaded locally: ${files.map(f => `\`${f}\``).join(', ')}`
+      : userText;
+  }
+  const diff = DISPLAY_DIFF_BLOCK.exec(out);
+  if (diff) {
+    const lineCount = diff[1].split(/\r?\n/).length;
+    out = `${out.slice(0, diff.index)}\n\n> Attached local git diff (${lineCount} lines)`;
+  }
+  return out;
 }
 
 export function createRoleMarkdownTransformer({ getModelTag = () => 'think' } = {}) {

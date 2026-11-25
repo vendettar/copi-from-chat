@@ -253,15 +253,68 @@ function jsonContainers(text) {
   return found;
 }
 
+function escapeControlCharsInStrings(raw) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (!inString) {
+      if (ch === '"') inString = true;
+      out += ch;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+      out += ch;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      out += ch;
+    } else if (ch === '"') {
+      inString = false;
+      out += ch;
+    } else if (ch === '\n') {
+      out += '\\n';
+    } else if (ch === '\r') {
+      out += '\\r';
+    } else if (ch === '\t') {
+      out += '\\t';
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
 function tryParseJsonRelaxed(raw) {
   try {
-    return { ok: true, value: JSON.parse(raw) };
+    return { ok: true, value: JSON.parse(raw), relaxed: false };
   } catch (firstError) {
-    // Recover harmless trailing commas (e.g. {"lines":["a",]}) locally without wasting a repair quota turn.
+    // 1. Recover harmless trailing commas (e.g. {"lines":["a",]}) without wasting a repair quota turn.
     const noTrailingComma = raw.replace(/,\s*([}\]])/g, '$1');
     if (noTrailingComma !== raw) {
       try {
-        return { ok: true, value: JSON.parse(noTrailingComma) };
+        return { ok: true, value: JSON.parse(noTrailingComma), relaxed: false };
+      } catch { /* try next recovery */ }
+    }
+    // 2. Recover raw unescaped newlines/tabs injected inside JSON strings by un-fenced Markdown rendering.
+    const escapedCtrl = escapeControlCharsInStrings(noTrailingComma);
+    if (escapedCtrl !== noTrailingComma) {
+      try {
+        return { ok: true, value: JSON.parse(escapedCtrl), relaxed: 'control_chars' };
+      } catch { /* try next recovery */ }
+    }
+    // 3. Recover typographic smart quotes (“ / ”) turned from ASCII quotes by un-fenced Markdown — ONLY
+    //    accepted downstream for read-only type="final" replies (never tool_calls!).
+    if (/[“”]/.test(escapedCtrl)) {
+      const straightQuotes = escapedCtrl.replace(/[“”]/g, '"');
+      try {
+        const value = JSON.parse(straightQuotes);
+        if (value && typeof value === 'object' && value.type === 'final') {
+          return { ok: true, value, relaxed: 'smart_quotes' };
+        }
       } catch { /* fall through to original error */ }
     }
     return { ok: false, error: firstError };
@@ -302,7 +355,8 @@ export function parseReply(reply, requestId, tools, { allowPlainTextFinal = fals
         const position = error.message.match(/position (\d+)/)?.[1];
         const offset = position !== undefined ? Number(position) : /end of JSON/i.test(error.message) ? raw.length : null;
         const points = offset === null ? 'unknown' : Array.from(raw.slice(offset)).slice(0, 8).map(char => 'U+' + char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' ') || 'EOF';
-        syntax = `candidate length=${raw.length}, error offset=${offset ?? 'unknown'}, code points=${points}`;
+        const errSummary = String(error.message ?? '').replace(/\s+/g, ' ').slice(0, 140);
+        syntax = `candidate length=${raw.length}, error="${errSummary}", offset=${offset ?? 'unknown'}, code points=${points}`;
         malformedCurrent ||= raw.includes(requestId);
         continue;
       }
@@ -545,8 +599,11 @@ export function createCopilotProvider(browser, {
           const basePref = overridePreference ?? getModelPreference();
           const turnContext = { isToolResultTurn: toolResultTurn, thinkLimited };
           const effectivePref = resolveEffectivePreference(basePref, turnContext);
+          const tierLabel = effectivePref?.kind === 'index'
+            ? `#${effectivePref.index}`
+            : (effectivePref?.name ?? 'auto');
 
-          onStatus('Sending to Copilot...');
+          onStatus(`Sending to Copilot (${tierLabel})...`);
           let previewed = false;
           try {
             const reply = await browser.ask(prompt, {
@@ -634,6 +691,17 @@ export function createCopilotProvider(browser, {
               lastReplySignature = replySignatureOf(reply);
               return { packet, requestId: current.requestId };
             } catch (error) {
+              if (error.code === 'COPILOT_REPLY_FORMAT') {
+                await onActivity('reply_format_error', {
+                  sessionId,
+                  requestId: current.requestId,
+                  attempt: correction,
+                  codeBlocks: reply?.codeBlocks?.length ?? 0,
+                  textLength: reply?.text?.length ?? 0,
+                  message: error.message.slice(0, 300),
+                  excerpt: String(reply?.text ?? '').slice(0, 400)
+                });
+              }
               if (error.code !== 'COPILOT_REPLY_FORMAT' || correction === 1) {
                 postSendUncertain = true;
                 throw error;

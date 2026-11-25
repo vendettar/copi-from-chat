@@ -83,8 +83,11 @@ function readReply(elements, previous) {
   const pres = [...body.querySelectorAll('pre')];
   if (body.matches('pre')) pres.unshift(body);
   const blocks = new Set(pres.filter(visible).map(pre => pre.querySelector('code') ?? pre));
-  for (const code of body.querySelectorAll('code')) {
-    if (!code.closest('pre') && visible(code) && /^\s*[\[{]/.test(code.textContent ?? '')) blocks.add(code);
+  for (const code of body.querySelectorAll('code, [data-testid*="code" i], [class*="codeBlock" i]')) {
+    if (!code.closest('pre') && visible(code)) {
+      const raw = code.textContent ?? '';
+      if (/^\s*[\[{]/.test(raw) || raw.includes('"requestId"')) blocks.add(code);
+    }
   }
   const readCode = node => {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
@@ -443,6 +446,20 @@ export class CopilotTab {
     } catch {
       return false;
     }
+  }
+
+  async stopGeneratingIfVisible() {
+    if (!this.page || this.page.isClosed()) return false;
+    try {
+      const stop = this.page.locator('button[data-testid="stop-button"]')
+        .or(this.page.getByRole('button', { name: /^(stop(?: generating(?: response)?| responding)?|停止(?:生成|响应|回應)?)(?:\s*\([^)]*\))?$/i }))
+        .filter({ visible: true }).first();
+      if (await stop.isVisible()) {
+        await stop.click({ timeout: 1500 }).catch(() => {});
+        return true;
+      }
+    } catch { /* best effort */ }
+    return false;
   }
 
   detachPage() {

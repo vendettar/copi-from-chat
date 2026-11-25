@@ -1,4 +1,4 @@
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { Container, SelectList, Spacer, Text } from '@earendil-works/pi-tui';
@@ -25,6 +25,11 @@ import {
   acquireProfileLock, acquireSessionLock, logActivity,
   readConfig, readIncompleteCheckpoints, saveConfig
 } from './storage.js';
+
+const CLI_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version; }
+  catch { return null; }
+})();
 
 const RESERVED_COMMANDS = new Set([
   'new', 'resume', 'quit', 'exit', 'model', 'think', 'quota', 'undo', 'readonly',
@@ -531,7 +536,9 @@ export async function createRuntime({
       webUI.setEdgeState('connecting');
       void activeBrowser.warm({ wait: false, onStatus: webUI.onStatus })
         .then(res => {
-          webUI.setEdgeState(res?.ready ? 'ready' : 'sign-in required');
+          const outdated = Boolean(res?.hostVersion && CLI_VERSION && res.hostVersion !== CLI_VERSION);
+          const readyLabel = outdated ? `ready (old host v${res.hostVersion} — run copi host stop)` : 'ready';
+          webUI.setEdgeState(res?.ready ? readyLabel : 'sign-in required');
         })
         .catch(error => {
           webUI.setEdgeState('offline');

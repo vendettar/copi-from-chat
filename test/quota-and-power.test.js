@@ -132,6 +132,24 @@ test('parseReply recovers trailing commas and allows clean plain-text final answ
     () => parseReply({ completed: true, text: '{"requestId":"r3","type":"tool_calls","calls":[broken' }, 'r3', [], { allowPlainTextFinal: true }),
     { code: 'COPILOT_REPLY_FORMAT' }
   );
+
+  // Un-fenced Markdown smart quotes (“ / ”) and raw newlines in read-only final replies recover locally at 0 quota!
+  const smartQuotedFinal = '<<<COPILOT_REPLY_START:r4>>>\n{“requestId”:“r4”,“type”:“final”,“lines”:[“Recovered smart quotes.”]}\n<<<COPILOT_REPLY_END:r4>>>';
+  const recoveredSmart = parseReply({ completed: true, text: smartQuotedFinal, codeBlocks: [] }, 'r4', []);
+  assert.equal(recoveredSmart.type, 'final');
+  assert.equal(recoveredSmart.text, 'Recovered smart quotes.');
+
+  // Smart quotes inside tool_calls must NEVER be guessed (safety first)!
+  const smartQuotedTool = '<<<COPILOT_REPLY_START:r5>>>\n{“requestId”:“r5”,“type”:“tool_calls”,“calls”:[{“name”:“bash”,“arguments”:{“command”:“echo hi”}}]}\n<<<COPILOT_REPLY_END:r5>>>';
+  assert.throws(
+    () => parseReply({ completed: true, text: smartQuotedTool, codeBlocks: [] }, 'r5', [{ name: 'bash' }]),
+    error => error.code === 'COPILOT_REPLY_FORMAT' && /error="[^"]+"/.test(error.message)
+  );
+
+  // Raw control newline inside a JSON string (from un-fenced Markdown) recovers cleanly!
+  const rawNewlineJson = '<<<COPILOT_REPLY_START:r6>>>\n{"requestId":"r6","type":"final","text":"line 1\nline 2"}\n<<<COPILOT_REPLY_END:r6>>>';
+  const recoveredNewline = parseReply({ completed: true, text: rawNewlineJson, codeBlocks: [] }, 'r6', []);
+  assert.equal(recoveredNewline.text, 'line 1\nline 2');
 });
 
 test('zero-turn workspace snapshot, @file preloading, and local post-edit syntax check work with zero web quota', async t => {

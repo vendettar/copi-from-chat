@@ -58,6 +58,12 @@ test('role markdown transformer distinguishes You vs Copi and toolHistory tracks
   );
   assert.match(preloadedUser, /Check src\/app\.js[\s\S]*Preloaded locally: `src\/app\.js`/);
   assert.doesNotMatch(preloadedUser, /const huge = 1/);
+  const diffUser = transform(
+    'Review changes.\n\nCurrent branch: main\n\nGit diff:\n```diff\n+line 1\n+line 2\n+line 3\n```',
+    { messageType: 'user' }
+  );
+  assert.match(diffUser, /Attached local git diff \(3 lines\)/);
+  assert.doesNotMatch(diffUser, /\+line 2/);
   const assistantOut = transform('Done.', { messageType: 'assistant' });
   assert.match(assistantOut, /^---\n\*\*▌ Copi\*\* `quick`\n\nDone\.$/);
   // Idempotent when called again.

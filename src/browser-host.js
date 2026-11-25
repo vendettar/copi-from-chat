@@ -1,14 +1,19 @@
 import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { dirname, resolve as resolvePath } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { readFile, unlink } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CopilotTab, isCleanSignedInChatPage, launchPersistentEdge, waitForChatReady } from './browser.js';
 import { getCopiPaths } from './paths.js';
-import { logActivity, readConfig } from './storage.js';
+import { logActivity, readConfig, writeFileAtomic } from './storage.js';
 
 const MAX_IDLE_TABS = 16;
 const HEARTBEAT_MS = 15000;
+const PACKAGE_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version; }
+  catch { return '0.1.6'; }
+})();
 
 function createMutex() {
   let chain = Promise.resolve();
@@ -42,13 +47,6 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
-async function writeFileAtomic(filePath, content) {
-  await mkdir(dirname(filePath), { recursive: true });
-  const temp = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  await writeFile(temp, content, { encoding: 'utf8', mode: 0o600 });
-  await rename(temp, filePath);
-}
-
 export async function startBrowserHost({
   copiHome,
   paths = getCopiPaths(copiHome),
@@ -56,7 +54,7 @@ export async function startBrowserHost({
   channel = process.platform === 'win32' ? 'msedge' : 'chrome',
   headless = false,
   context: injectedContext = null,
-  version = '0.1.5',
+  version = PACKAGE_VERSION,
   idleTimeoutMinutes,
   sendConfirmTimeoutMs,
   sendConfirmPollMs,
@@ -167,8 +165,17 @@ export async function startBrowserHost({
         return page;
       },
       onAbortClose: async () => {
-        // Only close this session's tab page on abort; never close the shared Edge window.
-        await tab.closePage();
+        // First try clicking Stop on the webpage. When closing the aborted tab, never close
+        // the sole remaining tab in the shared Edge window (which would exit Edge and drop SSO cookies).
+        await tab.stopGeneratingIfVisible();
+        const oldPage = tab.detachPage();
+        if (!oldPage || oldPage.isClosed()) return;
+        const livePages = context ? context.pages().filter(p => !p.isClosed()) : [];
+        if (context && livePages.length <= 1) {
+          const replacement = await context.newPage().catch(() => null);
+          if (replacement && !replacement.isClosed()) standbyPages.push(replacement);
+        }
+        await oldPage.close().catch(() => {});
       }
     });
     entry = {
@@ -238,6 +245,7 @@ export async function startBrowserHost({
         return sendJson(res, 200, {
           ...tabStatus,
           hostPid: process.pid,
+          hostVersion: version,
           port: server.address()?.port ?? null,
           browserOpen: Boolean(context)
         });
@@ -267,7 +275,7 @@ export async function startBrowserHost({
           return sendJson(res, 200, { ok: true, ...result });
         }
         pending.catch(() => {});
-        return sendJson(res, 200, { ok: true, ready: await entry.tab.isReady(), warming: true });
+        return sendJson(res, 200, { ok: true, ready: await entry.tab.isReady(), warming: true, hostVersion: version });
       }
 
       if (req.method === 'GET' && action === 'models') {

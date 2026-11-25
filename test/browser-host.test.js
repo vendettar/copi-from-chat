@@ -205,4 +205,16 @@ test('detaching an empty startup session for /resume reuses the signed-in tab wi
   assert.equal(droppedToZero, false, '/reconnect must never drop Edge to 0 open tabs');
   assert.equal(context.pages().filter(p => !p.isClosed()).length, 1);
   assert.equal(pageLoads, 2);
+
+  // 5. Aborting via Esc (onAbortClose) while S2 is the ONLY tab in Edge must also keep >=1 page alive!
+  const abortCheck = host.sessions.get('resumed-session');
+  let droppedOnAbort = false;
+  for (const p of context.pages()) {
+    p.once('close', () => {
+      if (context.pages().filter(x => !x.isClosed()).length === 0) droppedOnAbort = true;
+    });
+  }
+  await abortCheck.tab.onAbortClose();
+  assert.equal(droppedOnAbort, false, 'Esc abort must never close Edge\'s last tab');
+  assert.ok(context.pages().filter(p => !p.isClosed()).length >= 1);
 });

@@ -135,10 +135,10 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.1.5.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.1.6.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.1.5.tgz
+npm install -g ./copi-from-chat-0.1.6.tgz
 copi --help
 ```
 

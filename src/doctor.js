@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, readFileSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -10,6 +10,10 @@ import { resolveShellPath } from './runtime.js';
 import { inspectLock } from './storage.js';
 
 const exec = promisify(execFile);
+const CLI_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version; }
+  catch { return null; }
+})();
 
 function exists(filePath) {
   try { accessSync(filePath, constants.F_OK); return true; } catch { return false; }
@@ -71,14 +75,18 @@ export async function runDoctor({ paths = getCopiPaths(), browser } = {}) {
     checks.push({ name: 'Local locks', ok: true, detail: 'no lock directory yet' });
   }
 
-  // 6. Browser Host health
+  // 6. Browser Host health & version alignment
   const host = await getBrowserHostHealth(paths);
+  const hostVersion = host.health?.version ?? host.descriptor?.version ?? null;
+  const versionMismatch = Boolean(host.running && CLI_VERSION && hostVersion && hostVersion !== CLI_VERSION);
   checks.push({
     name: 'Browser Host',
-    ok: host.running,
-    warn: !host.running,
+    ok: host.running && !versionMismatch,
+    warn: !host.running || versionMismatch,
     detail: host.running
-      ? `running on 127.0.0.1:${host.descriptor.port} (PID ${host.descriptor.pid}, ${host.health.tabs?.length ?? 0} tab(s))`
+      ? (versionMismatch
+        ? `running older v${hostVersion} (CLI is v${CLI_VERSION}) on 127.0.0.1:${host.descriptor.port} — run "copi host stop" to apply updates`
+        : `running v${hostVersion ?? '?'} on 127.0.0.1:${host.descriptor.port} (PID ${host.descriptor.pid}, ${host.health.tabs?.length ?? 0} tab(s))`)
       : host.stale ? 'not running (stale browser-host.json)' : 'not running (starts automatically with copi)'
   });
 

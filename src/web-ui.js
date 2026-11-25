@@ -1,4 +1,5 @@
 import { basename } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { Container, SelectList, Spacer, Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { PROACTIVE_COMPACTION_THRESHOLD } from './compaction.js';
@@ -19,6 +20,10 @@ import { createUndoManager } from './undo.js';
 
 const ALL_TOOLS = ['read', 'bash', 'edit', 'write', 'grep', 'find'];
 const READONLY_TOOLS = ['read', 'grep', 'find'];
+const CLI_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version; }
+  catch { return null; }
+})();
 
 const SELECT_THEME = {
   selectedPrefix: text => `\x1b[36m${text}\x1b[0m`,
@@ -618,7 +623,10 @@ export function createWebUI(browser, {
           const compactionNote = messageCount > PROACTIVE_COMPACTION_THRESHOLD
             ? `${messageCount} messages (proactive compaction active on resume/reconnect)`
             : `${messageCount}/${PROACTIVE_COMPACTION_THRESHOLD} messages before proactive compaction`;
-          const hostDetail = liveStatus?.port ? ` (127.0.0.1:${liveStatus.port}, PID ${liveStatus.hostPid})` : '';
+          const versionNote = liveStatus?.hostVersion && CLI_VERSION && liveStatus.hostVersion !== CLI_VERSION
+            ? ` · OUTDATED host v${liveStatus.hostVersion} vs CLI v${CLI_VERSION} (run "copi host stop")`
+            : '';
+          const hostDetail = liveStatus?.port ? ` (127.0.0.1:${liveStatus.port}, PID ${liveStatus.hostPid}${liveStatus.hostVersion ? `, v${liveStatus.hostVersion}` : ''})` : '';
           const tabDetail = pState?.webTurnsInTab
             ? ` · web tab: ${pState.webTurnsInTab} turns (~${(pState.webCharsInTab / 1000).toFixed(1)}K chars${pState.cachedReads ? `, ${pState.cachedReads} cached reads` : ''})`
             : '';
@@ -628,7 +636,7 @@ export function createWebUI(browser, {
             `Context: ${compactionNote}${tabDetail}`,
             `Quota: ${formatQuotaShort(quota)} (${quota.date})`,
             `Model: ${modelPref}${activeModel ? ` (active: ${activeModel})` : ''}`,
-            `Edge: ${liveStatus?.state ?? edgeState}${hostDetail}${pState?.needsNewChat ? ' · web needs /reconnect or /new' : ''}`,
+            `Edge: ${liveStatus?.state ?? edgeState}${hostDetail}${versionNote}${pState?.needsNewChat ? ' · web needs /reconnect or /new' : ''}`,
             `Mode: ${readonlyState.enabled ? 'read-only (read, grep, find)' : 'read-write'} · undo turns: ${undoManager.turnCount()}`,
             `Instructions: ${loadedInstructionFiles.length ? loadedInstructionFiles.join(', ') : '(none)'}`,
             `Prompts: ${promptTemplates.length ? promptTemplates.map(p => `/${p.name}`).join(', ') : '(none)'}`,
