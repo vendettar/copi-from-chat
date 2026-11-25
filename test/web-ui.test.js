@@ -73,16 +73,22 @@ test('an off-screen running Bash row does not replay history just to update elap
   assert.equal(tui.fullRedraws, redraws);
   assert.equal(writes.some(text => text.includes('History 0')), false);
 
-  // Real progress still renders; the native final result keeps its recorded duration.
+  // Real progress still renders; the compact final result keeps its recorded duration and expands on Ctrl+O.
   row.updateResult({ ...result, content: [{ type: 'text', text: 'Build progress changed.' }] }, true);
   tui.requestRender();
   await delay(60);
   assert.ok(writes.some(text => text.includes('Build progress changed.')));
   row.updateResult({ ...result, durationMs: 4200 }, false);
-  assert.match(row.render(80).join('\n'), /Took 4\.2s/);
+  const collapsed = row.render(100).join('\n');
+  assert.match(collapsed, /Took 4\.2s/);
+  assert.match(collapsed, /Ctrl\+O/);
   assert.equal(renderers.execute, definition.execute);
   assert.equal(renderers.parameters, definition.parameters);
-  assert.equal(resolve('read', definition), definition);
+
+  // read tool also uses compact 1-line rendering when collapsed and full renderer when expanded.
+  const readRenderers = resolve('read', definition);
+  assert.notEqual(readRenderers, definition);
+  assert.equal(resolve('unknown_custom_tool', definition), definition);
 });
 
 test('working status changes once per phase and resets between agent turns', async t => {

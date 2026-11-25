@@ -19,12 +19,25 @@ Usage: copi [options] [prompt]
   -c, --continue          Resume the most recent saved session for this project
   -s, --session <id>      Resume a saved session by ID or JSONL file path
   -m, --model <target>    Web model preference: auto, quick, think, or 0-based menu index
+  -y, --yes               Auto-approve risky bash commands and outside-workspace edits
+  --no-bell               Disable completion bell for long responses
   --profile <name>        Launch a separate isolated Edge window (~/.copi/browser-profiles/<name>)
   -v, --version           Show version
   -h, --help              Show this help
 
-Interactive commands: /model, /new, /resume, /web, /quit
-Enter submits; Shift+Enter adds a line; Esc stops the current task.
+Interactive commands:
+  /model [auto|quick|think|N]   Read live models from Edge or switch preference
+  /inspect [N]                  Inspect a specific tool call's full arguments & output
+  /copy [code]                  Copy last assistant reply (or last code block) to clipboard
+  /diff                         Show git status and diff summary for the workspace
+  /status                       Show session, context, model, and Edge Browser Host status
+  /rename <name>                Set a display name for this saved session (shown in /resume)
+  /reconnect                    Open a fresh Edge tab and restore saved local history
+  /cleanup [days]               Prune old checkpoints and saved temp tool outputs
+  /bell [on|off]                Toggle completion bell for long responses
+  /new, /resume, /web, /quit
+
+Shortcuts: Enter submits · Shift+Enter newline · Esc stops · Ctrl+O toggles tool details · Ctrl+L /model
 Conversations are saved under ~/.copi/sessions. Multiple Git Bash windows share one Edge window with dedicated tabs.
 `;
 
@@ -39,6 +52,8 @@ try {
       continue: { type: 'boolean', short: 'c' },
       session: { type: 'string', short: 's' },
       model: { type: 'string', short: 'm' },
+      yes: { type: 'boolean', short: 'y' },
+      'no-bell': { type: 'boolean' },
       profile: { type: 'string' }
     }
   });
@@ -98,6 +113,8 @@ try {
       resumed,
       profile: values.profile,
       modelPreference,
+      autoApproveRisky: Boolean(values.yes),
+      bell: values['no-bell'] ? false : undefined,
       prompt,
       interactive
     });

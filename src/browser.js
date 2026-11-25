@@ -415,6 +415,31 @@ export class CopilotTab {
     }
   }
 
+  async resetTab({ warm = false, signal, onStatus = () => {} } = {}) {
+    await this.closePage();
+    this.uncertain = false;
+    this.used = false;
+    this.lastSelectedModel = null;
+    if (warm) {
+      void this.warm({ signal, onStatus }).catch(() => {});
+    }
+    return { reset: true };
+  }
+
+  async getStatus() {
+    const open = Boolean(this.page && !this.page.isClosed());
+    const ready = open ? await this.isReady() : false;
+    const state = ready ? 'ready' : open ? 'waiting_signin' : 'disconnected';
+    return {
+      state,
+      ready,
+      open,
+      busy: this.busy,
+      uncertain: this.uncertain,
+      activeModel: this.lastSelectedModel
+    };
+  }
+
   async selectModel({ signal, onStatus = () => {}, preference } = {}) {
     // Maximum-compatibility, index-based model selection:
     // M365 Copilot regularly changes model labels and switches between Chinese and English UI
@@ -927,6 +952,17 @@ export class CopilotBrowser {
 
   async setModelPreference(preference, options = {}) {
     return this.tab.setModelPreference(preference, options);
+  }
+
+  async resetTab(options = {}) {
+    return this.tab.resetTab(options);
+  }
+
+  async getStatus() {
+    if (!this.context) {
+      return { state: 'disconnected', ready: false, open: false, busy: this.busy, uncertain: this.uncertain, activeModel: this.lastSelectedModel };
+    }
+    return this.tab.getStatus();
   }
 
   async hasContinuation() {

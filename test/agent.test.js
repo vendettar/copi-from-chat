@@ -361,12 +361,21 @@ test('copi CLI --help and --version print standalone metadata', async () => {
   assert.match(helpOut, /--continue/);
   assert.match(helpOut, /--session <id>/);
   assert.match(helpOut, /--model <target>/);
+  assert.match(helpOut, /--yes/);
+  assert.match(helpOut, /--no-bell/);
   assert.match(helpOut, /--profile <name>/);
   assert.match(helpOut, /\/model/);
+  assert.match(helpOut, /\/inspect/);
+  assert.match(helpOut, /\/copy/);
+  assert.match(helpOut, /\/diff/);
+  assert.match(helpOut, /\/status/);
+  assert.match(helpOut, /\/rename/);
+  assert.match(helpOut, /\/reconnect/);
+  assert.match(helpOut, /\/cleanup/);
   assert.match(helpOut, /\/resume/);
 
   const { stdout: versionOut } = await exec(process.execPath, ['src/agent.js', '--version']);
-  assert.equal(versionOut.trim(), '0.0.8');
+  assert.equal(versionOut.trim(), '0.0.9');
 });
 
 test('interactive startup pre-warms Edge and modelController persists and applies preferences', async t => {

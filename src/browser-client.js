@@ -230,6 +230,32 @@ export class SharedBrowserClient {
     }
   }
 
+  async resetTab({ warm = true, signal } = {}) {
+    this.uncertain = false;
+    this.lastSelectedModel = null;
+    const info = await this._connect({ startIfMissing: true, signal });
+    if (!this.attached) await this.attach({ signal });
+    const response = await this._request(info, 'POST', `/sessions/${encodeURIComponent(this.sessionId)}/reset`, {
+      warm: Boolean(warm)
+    }, { signal });
+    return response.json();
+  }
+
+  async getStatus({ signal } = {}) {
+    const info = await this._connect({ startIfMissing: false, signal });
+    if (!info) {
+      return { state: 'disconnected', ready: false, open: false, busy: this.busy, uncertain: this.uncertain, activeModel: this.lastSelectedModel, hostPid: null, port: null };
+    }
+    try {
+      const response = await this._request(info, 'GET', `/sessions/${encodeURIComponent(this.sessionId)}/status`, undefined, { signal });
+      const data = await response.json();
+      if (data?.activeModel) this.lastSelectedModel = data.activeModel;
+      return data;
+    } catch {
+      return { state: 'disconnected', ready: false, open: false, busy: this.busy, uncertain: this.uncertain, activeModel: this.lastSelectedModel, hostPid: null, port: null };
+    }
+  }
+
   async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, onSnapshot = () => {}, onStatus = () => {} } = {}) {
     if (this.busy) {
       throw Object.assign(new Error('A browser request is already in progress.'), { beforeSend: true });

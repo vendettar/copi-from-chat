@@ -169,10 +169,23 @@ export function createCopilotProvider(browser, {
   onActivity = () => {},
   getIncompleteCheckpoints = async () => [],
   compactionThreshold = PROACTIVE_COMPACTION_THRESHOLD,
-  keepRecent = DEFAULT_KEEP_RECENT
+  keepRecent = DEFAULT_KEEP_RECENT,
+  control
 } = {}) {
   const implicitSession = randomUUID();
   let lastTurn = null, busy = false, needsNewChat = false;
+
+  if (control && typeof control === 'object') {
+    control.resetWebConversation = () => {
+      lastTurn = null;
+      needsNewChat = false;
+    };
+    control.getState = () => ({
+      hasAnchor: Boolean(lastTurn),
+      needsNewChat,
+      busy
+    });
+  }
 
   function stream(model, context, options = {}) {
     const events = createAssistantMessageEventStream();

@@ -69,11 +69,27 @@ The shared login state is stored under `~/.copi/shared-browser-profile`. `--prof
 
 ## Interactive commands
 
-- `/model [auto|quick|think|<index>]`: read live models from Edge or switch model preference
+- `/model [auto|quick|think|<index>]`: read live models from Edge or switch model preference (`Ctrl+L`)
+- `/inspect [N]`: open an interactive viewer for a specific tool call's full arguments and output
+- `/copy [code]`: copy the last assistant reply (or last fenced code block) to the clipboard
+- `/diff`: show `git status -s` and `git diff --stat` for the current workspace
+- `/status`: show session info, compaction threshold progress, loaded instructions, model, and Edge Browser Host status
+- `/rename <name>`: set a display name for this saved session (shown in `/resume`)
+- `/reconnect`: open a fresh Edge tab and restore saved local JSONL history on the next turn
+- `/cleanup [days]`: prune old tool checkpoints and temporary saved tool outputs (default: 14 days)
+- `/bell [on|off]`: toggle terminal completion bell for long responses
 - `/new`: new conversation
 - `/resume`: select a saved conversation
-- `/web`: show workspace, browser mode, model preference, and tools
+- `/web`: show workspace, browser mode, model preference, instructions, and tools
 - `/quit`: exit
+
+### Terminal UX, project instructions, and safety
+
+- **Clear role headers**: user messages (`▌ You`) and agent replies (`▌ Copi <model>`) render with distinct visual headers without altering saved JSONL transcripts.
+- **Compact tool folding**: `read`, `bash`, `edit`, `write`, `grep`, and `find` collapse to compact single-line summaries by default. Press **`Ctrl+O`** (or click a tool row) to expand/collapse full output and diffs, or use `/inspect` to inspect one specific call.
+- **Project instructions**: `AGENTS.md`, `CLAUDE.md`, and `.copi/instructions.md` in the workspace are loaded automatically into the session prompt.
+- **Safety confirmation**: destructive `bash` commands (such as `rm -rf`, `git reset --hard`, `git push --force`) and `write`/`edit` calls targeting paths outside the workspace require confirmation (pass `-y` / `--yes` to auto-approve).
+- **Completion bell**: rings when long responses complete (disable with `--no-bell` or `/bell off`).
 
 ## Local data
 
@@ -100,10 +116,10 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.0.8.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.0.9.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.0.8.tgz
+npm install -g ./copi-from-chat-0.0.9.tgz
 copi --help
 ```
 

@@ -8,6 +8,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import { CopilotBrowser } from './browser.js';
 import { SharedBrowserClient } from './browser-client.js';
+import { loadProjectInstructions } from './instructions.js';
 import {
   DEFAULT_MODEL_PREFERENCE, formatModelPreference, getBuiltinModelPresets,
   parseModelPreference, presetAliasForIndex
@@ -58,10 +59,21 @@ export function createModelController({ copiPaths, initialPreference = DEFAULT_M
   let preference = parseModelPreference(initialPreference);
   let activeBrowser = null;
   let lastSelectedLabel = null;
+  const listeners = new Set();
+
+  const notifyChange = () => {
+    for (const fn of listeners) {
+      try { fn(preference); } catch { /* ignore */ }
+    }
+  };
 
   return {
     getPreference: () => preference,
     getLastSelectedLabel: () => activeBrowser?.lastSelectedModel ?? lastSelectedLabel,
+    onChange(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
     attachBrowser(browser) {
       activeBrowser = browser;
       if (browser && 'modelPreference' in browser) {
@@ -90,6 +102,7 @@ export function createModelController({ copiPaths, initialPreference = DEFAULT_M
         result = response?.result ?? null;
         if (result?.label) lastSelectedLabel = result.label;
       }
+      notifyChange();
       return { preference: parsed, applied, result };
     }
   };
@@ -294,6 +307,8 @@ export async function createRuntime({
   profile,
   modelController,
   prewarmBrowser = false,
+  autoApproveRisky = false,
+  bellState,
   sharedBrowserOptions
 }) {
   const sessionId = sessionManager.getSessionId();
@@ -318,6 +333,8 @@ export async function createRuntime({
 
   modelController?.attachBrowser(activeBrowser);
 
+  const projectInstructions = await loadProjectInstructions(cwd);
+  const providerControl = {};
   let sessionRef = null;
   const webUI = createWebUI(activeBrowser, {
     copiPaths,
@@ -325,8 +342,15 @@ export async function createRuntime({
     profile,
     sessionLock,
     modelController,
+    providerControl,
+    loadedInstructionFiles: projectInstructions.files,
+    autoApproveRisky,
+    bellState,
+    getSessionMessages: () => sessionRef?.messages ?? [],
+    getLastAssistantText: () => sessionRef?.getLastAssistantText?.(),
     getSessionMessageCount: () => sessionRef?.messages?.length ?? 0
   });
+  const unsubModel = modelController?.onChange?.(() => webUI.requestFooterRender());
 
   try {
     const settingsManager = SettingsManager.inMemory({
@@ -344,18 +368,23 @@ export async function createRuntime({
     modelRuntime.registerNativeProvider(createCopilotProvider(activeBrowser, {
       onStatus: webUI.onStatus,
       onActivity: (event, data) => logActivity(copiPaths, event, data),
-      getIncompleteCheckpoints: id => readIncompleteCheckpoints(copiPaths, id)
+      getIncompleteCheckpoints: id => readIncompleteCheckpoints(copiPaths, id),
+      control: providerControl
     }));
+    const appendSystemPrompt = [
+      'Use Bash syntax and forward-slash paths on Windows. ' +
+      'Use grep and find to search project files; use bash for commands, builds and tests. ' +
+      'Keep tool output focused: read files with offset/limit and bound command output. Inspect large files in sections.'
+    ];
+    if (projectInstructions.promptSection) {
+      appendSystemPrompt.push(projectInstructions.promptSection);
+    }
     const services = await createAgentSessionServices({
       cwd, agentDir, settingsManager, modelRuntime,
       resourceLoaderOptions: {
         noExtensions: true, disabledBuiltinExtensions: ['mcp'], extensionFactories: [webUI.extension],
         noSkills: true, noPromptTemplates: true, noThemes: true,
-        appendSystemPrompt: [
-          'Use Bash syntax and forward-slash paths on Windows. ' +
-          'Use grep and find to search project files; use bash for commands, builds and tests. ' +
-          'Keep tool output focused: read files with offset/limit and bound command output. Inspect large files in sections.'
-        ]
+        appendSystemPrompt
       }
     });
     const created = await createAgentSessionFromServices({
@@ -371,16 +400,23 @@ export async function createRuntime({
         sessionId,
         cwd,
         profile: profile ?? null,
-        existingMessages: sessionRef.messages.length
+        existingMessages: sessionRef.messages.length,
+        instructions: projectInstructions.files
       });
     }
 
     // In interactive mode, immediately open Edge in the background so the user can sign in right away
     // and /model can read the live webpage options without waiting for the first prompt.
     if (prewarmBrowser && typeof activeBrowser?.warm === 'function') {
-      void activeBrowser.warm({ wait: false, onStatus: webUI.onStatus }).catch(error => {
-        void logActivity(copiPaths, 'browser_warm_error', { sessionId, message: error?.message ?? String(error) });
-      });
+      webUI.setEdgeState('connecting');
+      void activeBrowser.warm({ wait: false, onStatus: webUI.onStatus })
+        .then(res => {
+          webUI.setEdgeState(res?.ready ? 'ready' : 'sign-in required');
+        })
+        .catch(error => {
+          webUI.setEdgeState('offline');
+          void logActivity(copiPaths, 'browser_warm_error', { sessionId, message: error?.message ?? String(error) });
+        });
     }
 
     return {
@@ -388,6 +424,7 @@ export async function createRuntime({
       services, diagnostics: services.diagnostics
     };
   } catch (error) {
+    unsubModel?.();
     await sessionLock?.release();
     throw error;
   }
@@ -401,6 +438,8 @@ export async function runAgent({
   resumed = false,
   profile,
   modelPreference,
+  autoApproveRisky = false,
+  bell,
   prompt,
   interactive,
   browser,
@@ -411,14 +450,15 @@ export async function runAgent({
     profileLock = await acquireProfileLock(copiPaths, profile);
   }
 
+  const savedConfig = copiPaths ? await readConfig(copiPaths) : {};
   let initialPreference = modelPreference;
-  if (initialPreference === undefined && copiPaths) {
-    const config = await readConfig(copiPaths);
-    if (config.modelPreference !== undefined) {
-      try { initialPreference = parseModelPreference(config.modelPreference); } catch { /* ignore invalid saved value */ }
-    }
+  if (initialPreference === undefined && savedConfig.modelPreference !== undefined) {
+    try { initialPreference = parseModelPreference(savedConfig.modelPreference); } catch { /* ignore invalid saved value */ }
   }
   const modelController = createModelController({ copiPaths, initialPreference });
+  const bellEnabled = bell !== undefined ? Boolean(bell) : savedConfig.bell !== false;
+  const bellState = { enabled: bellEnabled, minMs: 5000 };
+  const effectiveAutoApprove = autoApproveRisky || savedConfig.confirmRiskyTools === false;
 
   let runtime;
   let mode;
@@ -432,6 +472,8 @@ export async function runAgent({
       profile,
       modelController,
       prewarmBrowser: Boolean(interactive),
+      autoApproveRisky: effectiveAutoApprove,
+      bellState,
       sharedBrowserOptions
     });
     runtime = await createAgentSessionRuntime(factory, {

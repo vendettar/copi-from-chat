@@ -56,7 +56,7 @@ export async function startBrowserHost({
   channel = process.platform === 'win32' ? 'msedge' : 'chrome',
   headless = false,
   context: injectedContext = null,
-  version = '0.0.8',
+  version = '0.0.9',
   sendConfirmTimeoutMs,
   sendConfirmPollMs,
   composerTimeoutMs,
@@ -197,11 +197,35 @@ export async function startBrowserHost({
         return;
       }
 
-      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach|warm|models|model)$/.exec(pathname);
+      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach|warm|models|model|reset|status)$/.exec(pathname);
       if (!match) return sendJson(res, 404, { error: 'Not found' });
 
       const sessionId = decodeURIComponent(match[1]);
       const action = match[2];
+
+      if (req.method === 'GET' && action === 'status') {
+        const entry = sessions.get(sessionId);
+        const tabStatus = entry
+          ? await entry.tab.getStatus()
+          : { state: 'disconnected', ready: false, open: false, busy: false, uncertain: false, activeModel: null };
+        return sendJson(res, 200, {
+          ...tabStatus,
+          hostPid: process.pid,
+          port: server.address()?.port ?? null,
+          browserOpen: Boolean(context)
+        });
+      }
+
+      if (req.method === 'POST' && action === 'reset') {
+        const body = await readJsonBody(req);
+        const { entry } = getOrCreateSession(sessionId);
+        entry.lastActiveAt = Date.now();
+        if (entry.activeAbort) entry.activeAbort.abort();
+        entry.lastTurn = null;
+        await entry.tab.resetTab({ warm: Boolean(body.warm) });
+        await logActivity(paths, 'tab_reset', { sessionId, warm: Boolean(body.warm) });
+        return sendJson(res, 200, { ok: true, reset: true });
+      }
 
       if (req.method === 'POST' && action === 'warm') {
         const body = await readJsonBody(req);
