@@ -43,7 +43,7 @@ M365 Copilot enforces a strict daily cap on `深度思考 / Think deeper`, while
 - **`smart` mode (default)**: uses `深度思考 / Think deeper` on your main prompt and automatically steps down to `快速响应 / Quick response` for mechanical tool-result follow-ups. If M365 reports a `Think deeper` daily limit (in either a reply bubble or a page-level `[role="alert"]` / toast banner), Copi marks it for today in `~/.copi/quota.json`, switches to `quick`, and continues cleanly without crashing.
 - **Ultra-lean wire payloads & adaptive rotation**: `continue` turns trim repeated protocol boilerplate by ~83%, `bootstrap` strips Pi harness `<docs>` and compacts tool schemas (~55% smaller), identical unchanged `read` calls within the same live tab are deduplicated on the wire, and long tabs auto-rotate cleanly by both turn count (25) and character budget (~60K chars).
 - **Zero-turn local pre-context**: new conversations locally preload a compact workspace snapshot (branch, `git status`, manifest, file tree) and expand both explicit `@path/to/file[:start-end]` mentions and plain relative workspace file paths (plus piped `stdin`), eliminating exploratory `read` round-trips.
-- **Sequential single-turn tool chaining & output denoising**: tool calls run sequentially in array order so Copilot can safely emit `[edit, bash("npm test")]` in **one** web turn (~33% fewer turns per edit); `bash` output strips ANSI codes, collapses `\r` progress bars, and folds duplicate lines before the 5K/10K budget; `write`/`edit` on `.js`/`.json` files automatically attach a zero-quota local syntax check right in the tool result.
+- **Sequential single-turn tool chaining, edit recovery & output denoising**: tool calls run sequentially in array order so Copilot can safely emit `[edit, bash("npm test")]` in **one** web turn (~33% fewer turns per edit); `grep` supports optional `context` lines (0–5) to inspect surrounding code without an extra `read` turn; failed `edit` calls automatically attach the closest current file lines locally; `bash` output strips ANSI codes, collapses `\r` progress bars, and folds duplicate lines before the 5K/10K budget; `write`/`edit` on `.js`/`.ts`/`.json`/`.py` files automatically attach a zero-quota local syntax check right in the tool result.
 - **Zero-cost plain-text & trailing-comma recovery**: clean plain-text final answers are accepted locally without burning a `mode: 'repair'` quota turn.
 - **One-shot `/think <prompt>`**: even when using `/model quick` or `/model auto`, run `/think <question>` to use `Think deeper` for a single turn and automatically return to your previous preference.
 - **Index-based compatibility**: `/model` reads live options from Edge and matches by positional index (`smart`, `quick`, `auto`, `think`, or `0..N`), staying resilient across Chinese/English UI and future model renames.
@@ -135,10 +135,10 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.1.1.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.1.2.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.1.1.tgz
+npm install -g ./copi-from-chat-0.1.2.tgz
 copi --help
 ```
 

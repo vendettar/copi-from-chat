@@ -13,7 +13,7 @@ import {
 import { createRuntime } from '../src/runtime.js';
 import { exportSessionToFile } from '../src/export.js';
 import { ensureCopiDirs, getCopiPaths } from '../src/paths.js';
-import { runPostEditSyntaxCheck } from '../src/post-edit-check.js';
+import { buildEditFailureHint, runPostEditSyntaxCheck } from '../src/post-edit-check.js';
 import { collectWorkspaceSnapshot, expandFileMentions } from '../src/precontext.js';
 import { loadPromptTemplates, renderPromptTemplate } from '../src/prompts.js';
 import { detectWebLimitNotice, formatQuotaShort, markThinkLimitedToday, readTodayQuota, recordWebTurn } from '../src/quota.js';
@@ -392,4 +392,95 @@ test('same-tab unchanged read deduplication omits repeated file bodies and char-
   msgs = [...msgs, a5, tr3];
   await run(msgs);
   assert.equal(requests[5].req.messages[0].content[0].text, modifiedBody);
+});
+
+test('edit-failure recovery attaches closest current lines (and ambiguous line numbers) locally with 0 quota', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'copi-edit-hint-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'repo');
+  const agentDir = join(root, 'agent');
+  await mkdir(cwd);
+
+  const lines = Array.from({ length: 40 }, (_, i) => `export const item${i + 1} = ${i + 1};`);
+  lines[24] = 'export function computeTotal(price, tax) { return price + tax; }';
+  lines[25] = 'export const dupValue = 1;';
+  lines[30] = 'export const dupValue = 1;';
+  await writeFile(join(cwd, 'calc.js'), `${lines.join('\n')}\n`);
+
+  // Case 1: Fuzzy-locate closest region when oldText has wrong whitespace/arg name.
+  const fuzzyHint = await buildEditFailureHint({
+    path: 'calc.js',
+    edits: [{ oldText: 'export function computeTotal(price, fee) { return price + fee; }', newText: 'x' }]
+  }, cwd);
+  assert.match(fuzzyHint, /Local edit recovery/);
+  assert.match(fuzzyHint, /25: export function computeTotal\(price, tax\)/);
+
+  // Case 2: Ambiguous multiple matches -> reports exact match line numbers.
+  const multiHint = await buildEditFailureHint({
+    path: 'calc.js',
+    edits: [{ oldText: 'export const dupValue = 1;', newText: 'export const dupValue = 2;' }]
+  }, cwd);
+  assert.match(multiHint, /matched 2 places.*26, 31/);
+
+  // Case 3: End-to-end inside runtime tool_result hook on a failed edit!
+  let capturedError = '';
+  let turn = 0;
+  const rt = await createRuntime({
+    cwd,
+    agentDir,
+    sessionManager: SessionManager.inMemory(cwd),
+    preloadWorkspace: false,
+    browser: {
+      async ask(prompt) {
+        turn++;
+        const req = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+        if (turn === 1) {
+          return mkReply(req, {
+            type: 'tool_calls',
+            calls: [{
+              name: 'edit',
+              arguments: {
+                path: 'calc.js',
+                edits: [{ oldText: 'export function computeTotal(price, wrongArg) { return price + wrongArg; }', newText: 'export function computeTotal(a, b) { return a + b; }' }]
+              }
+            }]
+          });
+        }
+        capturedError = req.messages.find(m => m.role === 'toolResult')?.content?.[0]?.text ?? '';
+        return mkReply(req, { type: 'final', lines: ['Saw recovery snippet.'] });
+      },
+      async close() {}
+    }
+  });
+  await rt.session.bindExtensions({});
+  await rt.session.prompt('Edit computeTotal.');
+  assert.match(capturedError, /Local edit recovery/);
+  assert.match(capturedError, /25: export function computeTotal\(price, tax\)/);
+});
+
+test('post-edit syntax check supports TypeScript and Python without creating __pycache__', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'copi-lang-check-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, 'good.ts'), 'export function add(a: number, b: number): number { return a + b; }\n');
+  await writeFile(join(root, 'bad.ts'), 'export function broken(a: number { return a; }\n');
+  await writeFile(join(root, 'good.py'), 'def add(a: int, b: int) -> int:\n    return a + b\n');
+  await writeFile(join(root, 'bad.py'), 'def broken(a:\n    return a\n');
+
+  const goodTs = await runPostEditSyntaxCheck('good.ts', root);
+  if (goodTs) {
+    assert.equal(goodTs.ok, true);
+    const badTs = await runPostEditSyntaxCheck('bad.ts', root);
+    assert.equal(badTs?.ok, false);
+    assert.match(badTs.note, /TS SYNTAX ERROR/);
+  }
+
+  const goodPy = await runPostEditSyntaxCheck('good.py', root);
+  if (goodPy) {
+    assert.equal(goodPy.ok, true);
+    const badPy = await runPostEditSyntaxCheck('bad.py', root);
+    assert.equal(badPy?.ok, false);
+    assert.match(badPy.note, /PYTHON SYNTAX ERROR/);
+    // Must not leave __pycache__ behind!
+    await assert.rejects(readFile(join(root, '__pycache__')), { code: 'ENOENT' });
+  }
 });

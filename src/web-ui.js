@@ -6,7 +6,7 @@ import { cleanupLocalArtifacts, copyToClipboard, extractLastCodeBlock, getGitDif
 import { runDoctor } from './doctor.js';
 import { exportSessionToFile } from './export.js';
 import { formatModelPreference } from './model-preference.js';
-import { runPostEditSyntaxCheck } from './post-edit-check.js';
+import { buildEditFailureHint, runPostEditSyntaxCheck } from './post-edit-check.js';
 import { expandFileMentions } from './precontext.js';
 import { renderPromptTemplate } from './prompts.js';
 import { formatQuotaShort, readTodayQuota } from './quota.js';
@@ -324,17 +324,31 @@ export function createWebUI(browser, {
         }
       });
 
-      // Zero-cost local JS/JSON syntax check right after write/edit (saves extra bash verification turns!).
+      const appendToolText = (existing, suffix) => {
+        const blocks = Array.isArray(existing) ? existing.map(b => ({ ...b })) : [];
+        const lastTextIdx = blocks.findLastIndex(b => b?.type === 'text' && typeof b.text === 'string');
+        if (lastTextIdx >= 0) {
+          blocks[lastTextIdx].text = `${blocks[lastTextIdx].text}${suffix}`;
+          return blocks;
+        }
+        return [...blocks, { type: 'text', text: suffix.trimStart() }];
+      };
+
+      // Zero-cost local hooks on tool_result:
+      // 1) When edit fails to match oldText, attach the closest current file lines to save a read turn.
+      // 2) After successful write/edit on JS/TS/JSON/Python, attach an instant local syntax check.
       pi.on('tool_result', async (event, ctx) => {
+        if (event.isError && event.toolName === 'edit') {
+          const hint = await buildEditFailureHint(event.input, ctx.cwd).catch(() => null);
+          if (!hint) return;
+          return { content: appendToolText(event.content, `\n\n${hint}`) };
+        }
         if (event.isError || !['write', 'edit'].includes(event.toolName)) return;
         const targetPath = event.input?.path;
         if (typeof targetPath !== 'string') return;
         const check = await runPostEditSyntaxCheck(targetPath, ctx.cwd);
         if (!check) return;
-        const existing = Array.isArray(event.content) ? event.content : [];
-        return {
-          content: [...existing, { type: 'text', text: `\n${check.note}` }]
-        };
+        return { content: appendToolText(event.content, `\n${check.note}`) };
       });
 
       pi.on('agent_start', () => {

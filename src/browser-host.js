@@ -56,7 +56,7 @@ export async function startBrowserHost({
   channel = process.platform === 'win32' ? 'msedge' : 'chrome',
   headless = false,
   context: injectedContext = null,
-  version = '0.1.1',
+  version = '0.1.2',
   idleTimeoutMinutes,
   sendConfirmTimeoutMs,
   sendConfirmPollMs,

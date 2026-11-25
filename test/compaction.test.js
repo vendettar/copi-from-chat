@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compactBootstrapMessages, PROACTIVE_COMPACTION_THRESHOLD } from '../src/compaction.js';
+import { compactBootstrapMessages, PROACTIVE_COMPACTION_THRESHOLD, stripPreloadedFileContext } from '../src/compaction.js';
 
 const user = text => ({ role: 'user', content: [{ type: 'text', text }] });
 const assistant = text => ({ role: 'assistant', content: [{ type: 'text', text }] });
@@ -101,4 +101,43 @@ test('recent turn boundary never orphans a toolResult from its assistant toolCal
   assert.equal(result.compacted, true);
   // Ensure the first message after the summary is never a bare toolResult.
   assert.notEqual(result.messages[2].role, 'toolResult');
+});
+
+test('compaction strips stale preloaded file dumps from older messages while keeping user text and latest preload intact', () => {
+  const preloadDump = '\n\n[Preloaded file context — already read locally, no need to re-read these sections]\n--- src/stale.js ---\n' + 'const old = 1;\n'.repeat(200);
+  const latestPreload = '\n\n[Preloaded file context — already read locally, no need to re-read these sections]\n--- src/fresh.js ---\nexport const fresh = true;';
+
+  const stripped = stripPreloadedFileContext('Fix src/stale.js' + preloadDump);
+  assert.match(stripped, /^Fix src\/stale\.js\n\[earlier preloaded files omitted during compaction: src\/stale\.js\]$/);
+
+  const messages = [
+    user('Initial goal.' + preloadDump),
+    assistant('Started.'),
+    user('Middle task.' + preloadDump),
+    assistant('Middle done.'),
+    user('Step 3.'),
+    assistant('Step 3 done.'),
+    user('Step 4.'),
+    assistantCall('t1', 'read', { path: 'src/big.js' }),
+    toolResult('t1', 'read', 'BIG_HEAD\n' + 'x'.repeat(4000) + '\nBIG_TAIL'),
+    assistant('Read big file.'),
+    user('Step 5.'),
+    assistant('Step 5 done.'),
+    user('Current task.' + latestPreload)
+  ];
+
+  const result = compactBootstrapMessages(messages, { threshold: 10, keepRecent: 6 });
+  assert.equal(result.compacted, true);
+  // Initial message keeps exact typed instruction but drops stale 3KB preload dump.
+  assert.ok(result.messages[0].content[0].text.startsWith('Initial goal.'));
+  assert.doesNotMatch(result.messages[0].content[0].text, /const old = 1/);
+  // Summary keeps middle instruction verbatim without stale preload dump.
+  assert.match(result.messages[1].content[0].text, /Middle task\./);
+  assert.doesNotMatch(result.messages[1].content[0].text, /const old = 1/);
+  // Stale oversized toolResult inside recent is trimmed.
+  const recentRead = result.messages.find(m => m.role === 'toolResult');
+  assert.match(recentRead.content[0].text, /trimmed from older toolResult during compaction/);
+  assert.ok(recentRead.content[0].text.length < 2200);
+  // Latest user prompt retains its fresh preloaded context verbatim!
+  assert.match(result.messages.at(-1).content[0].text, /export const fresh = true;/);
 });

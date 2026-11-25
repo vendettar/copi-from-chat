@@ -81,7 +81,7 @@ async function walkNonGitFiles(rootDir, signal) {
   return { files: files.sort(), truncated };
 }
 
-async function nonGitGrep({ target, directory, pattern, glob, literal, ignoreCase, limit, signal }) {
+async function nonGitGrep({ target, directory, pattern, glob, literal, ignoreCase, context = 0, limit, signal }) {
   let regex;
   try {
     const flags = ignoreCase ? 'i' : '';
@@ -103,6 +103,7 @@ async function nonGitGrep({ target, directory, pattern, glob, literal, ignoreCas
     candidateFiles = [basename(target)];
   }
 
+  const ctxLines = Math.max(0, Math.min(5, Math.floor(Number(context) || 0)));
   const matches = [];
   for (const rel of candidateFiles) {
     signal?.throwIfAborted();
@@ -113,9 +114,36 @@ async function nonGitGrep({ target, directory, pattern, glob, literal, ignoreCas
     const raw = await readFile(full, 'utf8').catch(() => null);
     if (!raw || raw.includes('\0')) continue;
     const lines = raw.split(/\r?\n/);
+    if (ctxLines === 0) {
+      for (let i = 0; i < lines.length; i++) {
+        if (regex.test(lines[i])) {
+          matches.push(`${rel}:${i + 1}:${lines[i]}`);
+          if (matches.length >= limit + 1) { truncated = true; break; }
+        }
+      }
+      continue;
+    }
+
+    const hitSet = new Set();
+    const ranges = [];
     for (let i = 0; i < lines.length; i++) {
-      if (regex.test(lines[i])) {
-        matches.push(`${rel}:${i + 1}:${lines[i]}`);
+      if (!regex.test(lines[i])) continue;
+      hitSet.add(i);
+      const start = Math.max(0, i - ctxLines);
+      const end = Math.min(lines.length - 1, i + ctxLines);
+      if (ranges.length && start <= ranges.at(-1)[1] + 1) {
+        ranges.at(-1)[1] = Math.max(ranges.at(-1)[1], end);
+      } else {
+        ranges.push([start, end]);
+      }
+    }
+    for (let r = 0; r < ranges.length; r++) {
+      if (matches.length >= limit + 1) { truncated = true; break; }
+      if (r > 0 && matches.length) matches.push('--');
+      const [start, end] = ranges[r];
+      for (let i = start; i <= end; i++) {
+        const sep = hitSet.has(i) ? ':' : '-';
+        matches.push(`${rel}${sep}${i + 1}${sep}${lines[i]}`);
         if (matches.length >= limit + 1) { truncated = true; break; }
       }
     }
@@ -191,29 +219,33 @@ export function createSearchTools(cwd, { allowNonGitFallback = false } = {}) {
   return [
     {
       name: 'grep', label: 'grep',
-      description: 'Search file contents. Returns path:line:content relative to path. Narrow the scope if results are partial; use read for full context.',
+      description: 'Search file contents. Returns path:line:content relative to path. Pass context (1-5) to include surrounding lines directly without an extra read.',
       promptSnippet: 'Search file contents',
-      promptGuidelines: ['Use the grep tool for content searches. Use read with offset/limit around matching line numbers.'],
+      promptGuidelines: ['Use grep for content searches; pass context (e.g. 2-4) when you need surrounding lines to edit without an extra read turn.'],
       parameters: { type: 'object', required: ['pattern'], additionalProperties: false, properties: {
         pattern: { type: 'string', minLength: 1, description: 'Text to find; extended regular expression when literal=false' },
         path: { ...pathParameter, description: 'Directory or file to search, relative to the project or absolute (default: .)' },
         glob: { type: 'string', description: 'Filename wildcard, e.g. *.js (directory searches only)' },
         literal: { type: 'boolean', description: 'Literal matching (default: true); false uses extended regex' },
-        ignoreCase: { type: 'boolean', description: 'Ignore letter case (default: false)' }, limit: limitParameter
+        ignoreCase: { type: 'boolean', description: 'Ignore letter case (default: false)' },
+        context: { type: 'integer', minimum: 0, maximum: 5, description: 'Context lines before/after each match (0-5, default: 0)' },
+        limit: limitParameter
       } },
-      async execute(_id, { pattern, path = '.', glob, literal = true, ignoreCase = false, limit = 50 }, signal, _onUpdate, ctx) {
+      async execute(_id, { pattern, path = '.', glob, literal = true, ignoreCase = false, context = 0, limit = 50 }, signal, _onUpdate, ctx) {
         signal?.throwIfAborted();
         const target = resolve(ctx?.cwd || cwd, path), directory = (await stat(target)).isDirectory();
         if (!directory && glob) throw new Error('Use glob with a directory path, or search the file without glob.');
+        const ctxLines = Math.max(0, Math.min(5, Math.floor(Number(context) || 0)));
         const args = ['grep', '--untracked', '--exclude-standard', '-n', '-I', '--no-color', '--no-heading', '--no-break', '--no-column', literal ? '-F' : '-E'];
         if (ignoreCase) args.push('-i');
+        if (ctxLines > 0) args.push('-C', String(ctxLines));
         args.push('-e', pattern, '--', directory ? (glob || '.') : `:(literal)${basename(target)}`);
         try {
           const result = await git(directory ? target : dirname(target), args, signal);
           return formatResult(records(result, '\n'), limit, result.truncated, 'grep');
         } catch (error) {
           if (allowNonGitFallback && isNotGitRepoError(error)) {
-            return nonGitGrep({ target, directory, pattern, glob, literal, ignoreCase, limit, signal });
+            return nonGitGrep({ target, directory, pattern, glob, literal, ignoreCase, context: ctxLines, limit, signal });
           }
           throw error;
         }

@@ -104,3 +104,46 @@ test('cancellation and a non-repository path never trigger an unrestricted searc
     return true;
   });
 });
+
+test('grep supports optional context lines in both Git repos and non-Git fallback workspaces', async t => {
+  const { cwd, call } = await project(t);
+  await writeFile(join(cwd, 'src/ctx.js'), [
+    'const before2 = 1;',
+    'const before1 = 2;',
+    'const TARGET_LINE = 3;',
+    'const after1 = 4;',
+    'const after2 = 5;'
+  ].join('\n') + '\n');
+
+  const gitRes = await call('grep', { path: 'src/ctx.js', pattern: 'TARGET_LINE', context: 2 });
+  assert.match(gitRes, /ctx\.js-1-const before2 = 1;/);
+  assert.match(gitRes, /ctx\.js-2-const before1 = 2;/);
+  assert.match(gitRes, /ctx\.js:3:const TARGET_LINE = 3;/);
+  assert.match(gitRes, /ctx\.js-4-const after1 = 4;/);
+  assert.match(gitRes, /ctx\.js-5-const after2 = 5;/);
+
+  // Non-Git directory with allowNonGitFallback: true
+  const nonGitDir = await mkdtemp(join(tmpdir(), 'copi-grep-ctx-nongit-'));
+  t.after(() => rm(nonGitDir, { recursive: true, force: true }));
+  await writeFile(join(nonGitDir, 'sample.js'), [
+    'line1',
+    'line2',
+    'HIT_ONE',
+    'line4',
+    'line5',
+    'line6',
+    'line7',
+    'HIT_TWO',
+    'line9'
+  ].join('\n') + '\n');
+
+  const tools = Object.fromEntries(createSearchTools(nonGitDir, { allowNonGitFallback: true }).map(tool => [tool.name, tool]));
+  const nonGitRes = (await tools.grep.execute('c1', { pattern: 'HIT_', context: 1 })).content[0].text;
+  assert.match(nonGitRes, /sample\.js-2-line2/);
+  assert.match(nonGitRes, /sample\.js:3:HIT_ONE/);
+  assert.match(nonGitRes, /sample\.js-4-line4/);
+  assert.match(nonGitRes, /\n--\n/);
+  assert.match(nonGitRes, /sample\.js-7-line7/);
+  assert.match(nonGitRes, /sample\.js:8:HIT_TWO/);
+  assert.match(nonGitRes, /sample\.js-9-line9/);
+});

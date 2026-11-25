@@ -1,7 +1,58 @@
 export const PROACTIVE_COMPACTION_THRESHOLD = 12;
 export const DEFAULT_KEEP_RECENT = 6;
+const RECENT_TOOL_RESULT_COMPACT_MAX = 2400;
 
 const CHECK_COMMAND_PATTERN = /\b(test|check|lint|typecheck|tsc|build|pytest|vitest|jest|mocha|cargo\s+test|go\s+test|mvn\s+test|gradle\s+test|npm\s+run\s+(?:test|check|lint|build)|git\s+status)\b/i;
+const PRELOADED_BLOCK_PATTERN = /\n\n\[Preloaded @?file context — [^\]]+\]\n([\s\S]*)$/;
+
+// Strip synthetic auto-appended preloaded file dumps from older user messages during compaction
+// while keeping the user's actual typed instruction 100% verbatim.
+export function stripPreloadedFileContext(text) {
+  if (typeof text !== 'string') return text;
+  const match = PRELOADED_BLOCK_PATTERN.exec(text);
+  if (!match) return text;
+  const userText = text.slice(0, match.index);
+  const files = [...match[1].matchAll(/^--- @?(.+?) ---$/gm)].map(m => m[1].trim()).filter(Boolean);
+  const note = files.length
+    ? `\n[earlier preloaded files omitted during compaction: ${files.join(', ')}]`
+    : '';
+  return `${userText}${note}`;
+}
+
+function stripMessagePreloads(message) {
+  if (!message || message.role !== 'user') return message;
+  if (typeof message.content === 'string') {
+    const cleaned = stripPreloadedFileContext(message.content);
+    return cleaned === message.content ? message : { ...message, content: cleaned };
+  }
+  if (!Array.isArray(message.content)) return message;
+  let changed = false;
+  const content = message.content.map(block => {
+    if (block?.type !== 'text' || typeof block.text !== 'string') return block;
+    const cleaned = stripPreloadedFileContext(block.text);
+    if (cleaned === block.text) return block;
+    changed = true;
+    return { ...block, text: cleaned };
+  });
+  return changed ? { ...message, content } : message;
+}
+
+function trimStaleRecentToolResults(recent) {
+  // Never trim trailing live toolResult messages that belong to the current in-flight turn.
+  let trailingCutoff = recent.length;
+  while (trailingCutoff > 0 && recent[trailingCutoff - 1]?.role === 'toolResult') {
+    trailingCutoff--;
+  }
+  return recent.map((message, index) => {
+    if (index >= trailingCutoff || message?.role !== 'toolResult') return message;
+    const raw = extractText(message.content);
+    if (raw.length <= RECENT_TOOL_RESULT_COMPACT_MAX) return message;
+    const head = raw.slice(0, 1400);
+    const tail = raw.slice(-500);
+    const trimmed = `${head}\n\n[... ${raw.length - 1900} chars trimmed from older toolResult during compaction ...]\n\n${tail}`;
+    return { ...message, content: [{ type: 'text', text: trimmed }] };
+  });
+}
 
 function extractText(content) {
   if (typeof content === 'string') return content;
@@ -71,7 +122,7 @@ function buildSummaryText(olderMessages, incompleteCheckpoints = []) {
 
   for (const message of olderMessages) {
     if (message.role === 'user') {
-      const text = extractText(message.content);
+      const text = stripPreloadedFileContext(extractText(message.content));
       if (text.trim()) userInstructions.push(text);
       continue;
     }
@@ -244,8 +295,11 @@ export function compactBootstrapMessages(messages, {
     };
   }
 
-  const prefix = messages.slice(0, firstUserIndex + 1);
-  const recent = messages.slice(recentStart);
+  const prefix = messages.slice(0, firstUserIndex + 1).map(stripMessagePreloads);
+  const lastUserIndex = messages.length - 1;
+  const recent = trimStaleRecentToolResults(
+    messages.slice(recentStart).map((msg, idx) => (recentStart + idx < lastUserIndex ? stripMessagePreloads(msg) : msg))
+  );
   const summaryMessage = {
     role: 'assistant',
     content: [{ type: 'text', text: buildSummaryText(olderMessages, incompleteCheckpoints) }]
