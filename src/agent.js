@@ -42,7 +42,7 @@ Interactive commands:
   /readonly [on|off]                 Toggle read-only exploration mode
   /inspect [N]                       Inspect a specific tool call's full arguments & output
   /review | /commit | /fix           Built-in prompt workflows (+ custom ~/.copi/prompts/*.md)
-  /copy [code]                       Copy last assistant reply (or last code block) to clipboard
+  /copy                              Copy last assistant reply to clipboard (/copy-code for last code block)
   /diff                              Show git status and diff summary for the workspace
   /status                            Show session, quota, compaction, model, and Edge status
   /doctor                            Check environment, Browser Host, quota, and DOM selectors

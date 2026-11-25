@@ -4,7 +4,6 @@ import { Container, SelectList, Spacer, Text, truncateToWidth } from '@earendil-
 import { PROACTIVE_COMPACTION_THRESHOLD } from './compaction.js';
 import { cleanupLocalArtifacts, copyToClipboard, extractLastCodeBlock, getGitDiffSummary } from './commands.js';
 import { runDoctor } from './doctor.js';
-import { exportSessionToFile } from './export.js';
 import { formatModelPreference } from './model-preference.js';
 import { buildEditFailureHint, runPostEditSyntaxCheck } from './post-edit-check.js';
 import { expandFileMentions } from './precontext.js';
@@ -541,26 +540,6 @@ export function createWebUI(browser, {
         }
       });
 
-      pi.registerCommand('export', {
-        description: 'Export the current conversation to a Markdown report (usage: /export [file.md])',
-        handler: async (args, ctx) => {
-          const messages = getSessionMessages();
-          if (!messages.length) {
-            ctx.ui.notify('No messages to export yet.', 'warning');
-            return;
-          }
-          const sessionName = typeof pi.getSessionName === 'function' ? pi.getSessionName() : undefined;
-          const res = await exportSessionToFile({
-            cwd: ctx.cwd,
-            sessionId,
-            sessionName,
-            messages,
-            outputPath: args
-          });
-          ctx.ui.notify(`Exported session (${(res.bytes / 1024).toFixed(1)} KB) to ${res.path.replaceAll('\\', '/')}`, 'info');
-        }
-      });
-
       pi.registerCommand('inspect', {
         description: 'Inspect a specific tool call in detail (usage: /inspect [number])',
         handler: async (args, ctx) => {
@@ -589,23 +568,23 @@ export function createWebUI(browser, {
         }
       });
 
-      pi.registerCommand('copy', {
-        description: 'Copy the last assistant reply (or "/copy code" for the last code block)',
-        handler: async (args, ctx) => {
+      // Built-in /copy and /export are handled directly by CopiInteractiveMode to avoid command conflicts.
+      pi.registerCommand('copy-code', {
+        description: 'Copy the last fenced code block from Copi\'s reply to the clipboard',
+        handler: async (_args, ctx) => {
           const reply = getLastAssistantText();
           if (!reply || !reply.trim()) {
             ctx.ui.notify('No assistant reply available to copy yet.', 'warning');
             return;
           }
-          const mode = (args ?? '').trim().toLowerCase();
-          const target = mode === 'code' ? extractLastCodeBlock(reply) : reply;
+          const target = extractLastCodeBlock(reply);
           if (!target) {
             ctx.ui.notify('No fenced code block found in the last reply.', 'warning');
             return;
           }
           try {
             await copyToClipboard(target);
-            ctx.ui.notify(`Copied ${mode === 'code' ? 'last code block' : 'last reply'} (${target.length} chars) to clipboard.`, 'info');
+            ctx.ui.notify(`Copied last code block (${target.length} chars) to clipboard.`, 'info');
           } catch (error) {
             ctx.ui.notify(`Could not copy to clipboard: ${error.message}`, 'error');
           }

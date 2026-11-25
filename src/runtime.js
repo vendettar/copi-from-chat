@@ -8,6 +8,8 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import { CopilotBrowser } from './browser.js';
 import { SharedBrowserClient } from './browser-client.js';
+import { copyToClipboard } from './commands.js';
+import { exportSessionToFile } from './export.js';
 import { loadProjectInstructions } from './instructions.js';
 import {
   DEFAULT_MODEL_PREFERENCE, formatModelPreference, getBuiltinModelPresets,
@@ -26,8 +28,10 @@ import {
 
 const RESERVED_COMMANDS = new Set([
   'new', 'resume', 'quit', 'exit', 'model', 'think', 'quota', 'undo', 'readonly',
-  'doctor', 'export', 'inspect', 'copy', 'diff', 'status', 'rename', 'reconnect',
-  'cleanup', 'bell', 'web', 'help', 'settings', 'compact', 'fork', 'tree', 'clone', 'import'
+  'doctor', 'export', 'inspect', 'copy', 'copy-code', 'diff', 'status', 'rename', 'reconnect',
+  'cleanup', 'bell', 'web', 'help', 'settings', 'compact', 'fork', 'tree', 'clone', 'import',
+  'thinking', 'scoped-models', 'share', 'bug', 'name', 'session', 'changelog', 'hotkeys',
+  'trust', 'login', 'logout', 'reload'
 ]);
 
 function pathAccessible(filePath) {
@@ -240,6 +244,50 @@ class CopiInteractiveMode extends InteractiveMode {
       container.addChild(new Text('\x1b[2mUse ↑/↓ + Enter to choose, Esc to cancel, or /model smart|quick|auto|think|<index>\x1b[0m', 0, 0));
       return { component: container, focus: list };
     });
+  }
+
+  async handleExportCommand(text) {
+    const rawArg = typeof text === 'string' && text.startsWith('/export')
+      ? text.slice('/export'.length).trim()
+      : '';
+    // Keep Pi's built-in HTML and JSONL exporters when explicitly requested, and default to clean Markdown.
+    if (rawArg.endsWith('.html') || rawArg.endsWith('.jsonl')) {
+      return super.handleExportCommand(text);
+    }
+    const messages = this.session?.messages ?? [];
+    if (!messages.length) {
+      this.showWarning('No messages to export yet.');
+      return;
+    }
+    try {
+      const res = await exportSessionToFile({
+        cwd: this.session.cwd ?? process.cwd(),
+        sessionId: this.session.sessionManager?.getSessionId?.(),
+        sessionName: this.session.sessionManager?.getSessionName?.(),
+        messages,
+        outputPath: rawArg || undefined
+      });
+      this.showStatus(`Exported Markdown session (${(res.bytes / 1024).toFixed(1)} KB) to ${res.path.replaceAll('\\', '/')}`);
+    } catch (error) {
+      this.showError(`Failed to export session: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async handleCopyCommand(options = {}) {
+    if (options?.preferSelection && typeof this.ui?.hasActiveSelection === 'function' && this.ui.hasActiveSelection()) {
+      return super.handleCopyCommand(options);
+    }
+    const reply = this.session?.getLastAssistantText?.();
+    if (!reply || !reply.trim()) {
+      this.showWarning('No assistant reply available to copy yet.');
+      return;
+    }
+    try {
+      await copyToClipboard(reply);
+      this.showStatus(`Copied last reply (${reply.length} chars) to clipboard.`);
+    } catch (error) {
+      this.showError(`Could not copy to clipboard: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async handleImportCommand() { this.showWarning('Session import is disabled. Use /resume or /new.'); }

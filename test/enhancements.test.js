@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { normalizeContext } from '@earendil-works/pi-ai';
-import { createAgentSessionRuntime, SessionManager } from '@earendil-works/pi-coding-agent';
+import { createAgentSessionRuntime, InteractiveMode, SessionManager } from '@earendil-works/pi-coding-agent';
 import { cleanupLocalArtifacts, extractLastCodeBlock, getGitDiffSummary } from '../src/commands.js';
 import { loadProjectInstructions } from '../src/instructions.js';
 import { createCopilotProvider } from '../src/pi-provider.js';
@@ -217,6 +217,13 @@ test('web-ui commands (/status, /rename, /reconnect, /bell, tool_call safety gua
 
   await commands.get('bell').handler('off', ctx);
   assert.match(notes.at(-1).msg, /Completion bell: off/);
+
+  // Ensure NO registered extension command conflicts with Pi's built-in interactive slash commands.
+  const fakeRunner = {
+    getRegisteredCommands: () => [...commands.keys()].map(name => ({ name, invocationName: name, sourceInfo: { path: '<inline>' } }))
+  };
+  const conflicts = InteractiveMode.prototype.getBuiltInCommandConflictDiagnostics.call({}, fakeRunner);
+  assert.deepEqual(conflicts, []);
 
   // Destructive tool_call blocked when user declines confirm dialog.
   const blocked = await handlers.get('tool_call')({ toolName: 'bash', input: { command: 'rm -rf /tmp/foo' } }, ctx);

@@ -86,7 +86,7 @@ The shared login state is stored under `~/.copi/shared-browser-profile`. `--prof
 - `/readonly [on|off]`: toggle read-only exploration mode (`read`, `grep`, `find` only)
 - `/inspect [N]`: open an interactive viewer for a specific tool call's full arguments and output
 - `/review` · `/commit` · `/fix`: built-in prompt workflows (plus custom `~/.copi/prompts/*.md` and `.copi/prompts/*.md`)
-- `/copy [code]`: copy the last assistant reply (or last fenced code block) to the clipboard
+- `/copy` · `/copy-code`: copy the last assistant reply (or last fenced code block) to the clipboard
 - `/diff`: show `git status -s` and `git diff --stat` for the current workspace
 - `/status`: show session info, daily quota, compaction progress, loaded instructions, model, and Edge Browser Host status
 - `/doctor`: check Node, Git Bash, Edge, Browser Host, quota, and live M365 DOM selectors
@@ -135,10 +135,10 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.1.2.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.1.3.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.1.2.tgz
+npm install -g ./copi-from-chat-0.1.3.tgz
 copi --help
 ```
 
