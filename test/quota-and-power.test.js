@@ -246,6 +246,12 @@ test('lean continue header, compact bootstrap wire schemas, and <docs> stripping
   assert.ok(contHeader.length < 650, `Expected continue header < 650 chars, got ${contHeader.length}`);
   assert.match(contPrompt, /\nTASK_CONTEXT_JSON:\n/);
   assert.match(contPrompt, /<<<COPILOT_REPLY_START:req-123>>>/);
+  assert.match(contPrompt, /```json/);
+
+  assert.throws(
+    () => parseReply({ completed: true, text: '<<<COPILOT_REPLY_START:r1>>>\n{"requestId":"r1","type":"tool_calls","calls":[{"name":"bash","arguments":{"command":"python -c "p=1""}}]}\n<<<COPILOT_REPLY_END:r1>>>', codeBlocks: [] }, 'r1', [{ name: 'bash' }]),
+    error => error.code === 'COPILOT_REPLY_FORMAT' && /Missing ```json code fence/.test(error.message)
+  );
 
   const bloatedSys = 'Intro.\n\n<tools>\n- read: Read\n</tools>\n\n<rules>\n- Be concise\n</rules>\n\n<docs>\nPi docs: ' + 'x'.repeat(1200) + '\n</docs>\n\n<addendum>\nKeep this.\n</addendum>';
   const compactSys = compactWireSystemPrompt(bloatedSys);
@@ -483,4 +489,74 @@ test('post-edit syntax check supports TypeScript and Python without creating __p
     // Must not leave __pycache__ behind!
     await assert.rejects(readFile(join(root, '__pycache__')), { code: 'ENOENT' });
   }
+});
+
+test('short monotonic requestIds recover gracefully when model mistypes/echoes previousRequestId on a new reply, while identical stale replies hard-stop', async () => {
+  const seen = [];
+  let turn1Reply;
+  const provider = createCopilotProvider({
+    async ask(prompt, options) {
+      const req = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+      seen.push({ req, options });
+      if (seen.length === 1) {
+        const json = JSON.stringify({ requestId: req.requestId, type: 'final', lines: ['First answer.'] });
+        turn1Reply = {
+          completed: true,
+          text: `<<<COPILOT_REPLY_START:${req.requestId}>>>\n${json}\n<<<COPILOT_REPLY_END:${req.requestId}>>>`,
+          codeBlocks: [json]
+        };
+        return turn1Reply;
+      }
+      if (seen.length === 2) {
+        // Brand-new reply text, but model accidentally echoed previousRequestId in markers & JSON!
+        const wrongId = req.previousRequestId;
+        const json = JSON.stringify({ requestId: wrongId, type: 'final', lines: ['Second answer with echoed ID.'] });
+        return {
+          completed: true,
+          text: `<<<COPILOT_REPLY_START:${wrongId}>>>\n${json}\n<<<COPILOT_REPLY_END:${wrongId}>>>`,
+          codeBlocks: [json]
+        };
+      }
+      if (seen.length === 3) {
+        // Repair succeeds with the NEW requestId!
+        const json = JSON.stringify({ requestId: req.requestId, type: 'final', lines: ['Second answer fixed.'] });
+        return {
+          completed: true,
+          text: `<<<COPILOT_REPLY_START:${req.requestId}>>>\n${json}\n<<<COPILOT_REPLY_END:${req.requestId}>>>`,
+          codeBlocks: [json]
+        };
+      }
+      // Turn 3 simulates an IDENTICAL stale bubble from turn 2 -> must hard-stop without repair!
+      const prevJson = JSON.stringify({ requestId: seen[2].req.requestId, type: 'final', lines: ['Second answer fixed.'] });
+      return {
+        completed: true,
+        text: `<<<COPILOT_REPLY_START:${seen[2].req.requestId}>>>\n${prevJson}\n<<<COPILOT_REPLY_END:${seen[2].req.requestId}>>>`,
+        codeBlocks: [prevJson]
+      };
+    }
+  });
+
+  const run = async msgs => {
+    const s = provider.streamSimple(provider.getModels()[0], normalizeContext({ systemPrompt: 'Work.', messages: msgs, tools: [] }), { sessionId: 'reqid-s' });
+    for await (const _ of s) {}
+    return s.result();
+  };
+
+  const r1 = await run([user('Turn 1')]);
+  assert.equal(r1.stopReason, 'stop');
+  assert.match(seen[0].req.requestId, /^r1-[0-9a-f]{4}$/);
+
+  // Turn 2: model echoed previousRequestId on a brand-new reply -> auto-repaired cleanly in 1 repair pass!
+  const r2 = await run([user('Turn 1'), r1, user('Turn 2')]);
+  assert.equal(r2.stopReason, 'stop');
+  assert.equal(r2.content[0].text, 'Second answer fixed.');
+  assert.equal(seen[1].options.previousRequestId, seen[0].req.requestId);
+  assert.equal(seen[2].req.mode, 'repair');
+  assert.match(seen[2].req.requestId, /^r3-[0-9a-f]{4}$/);
+
+  // Turn 3: exact identical stale reply returned -> hard-stops immediately WITHOUT burning a repair turn!
+  const r3 = await run([user('Turn 1'), r1, user('Turn 2'), r2, user('Turn 3')]);
+  assert.equal(r3.stopReason, 'error');
+  assert.match(r3.errorMessage, /Reply markers belong to a different request/);
+  assert.equal(seen.length, 4);
 });

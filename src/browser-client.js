@@ -291,7 +291,7 @@ export class SharedBrowserClient {
     }
   }
 
-  async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, turnContext, onSnapshot = () => {}, onStatus = () => {} } = {}) {
+  async ask(message, { signal, fresh = false, requireContinuation = false, previousRequestId, modelPreference, turnContext, onSnapshot = () => {}, onStatus = () => {} } = {}) {
     if (this.busy) {
       throw Object.assign(new Error('A browser request is already in progress.'), { beforeSend: true });
     }
@@ -336,6 +336,7 @@ export class SharedBrowserClient {
           message,
           fresh,
           requireContinuation,
+          ...(previousRequestId !== undefined ? { previousRequestId } : {}),
           modelPreference: modelPreference !== undefined ? parseModelPreference(modelPreference) : this.modelPreference,
           ...(turnContext !== undefined ? { turnContext } : {})
         }),

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createProvider, createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools } from '@earendil-works/pi-ai';
 import { compactBootstrapMessages, PROACTIVE_COMPACTION_THRESHOLD, DEFAULT_KEEP_RECENT } from './compaction.js';
 import { DEFAULT_MODEL_PREFERENCE, resolveEffectivePreference } from './model-preference.js';
@@ -178,21 +178,27 @@ function dedupeRepeatedReadResults(messages, readCallsById, tabReadCache) {
 
 export function promptFor(payload) {
   if (payload.mode === 'continue') {
-    return `Continue this local session after previousRequestId using the established systemPrompt and tools. messages has ONLY new user input or local toolResults. Do not repeat completed work; calls execute sequentially in array order (you may chain [edit, bash("...")] in one turn).
-Reply with exact markers and ONE single-line fenced json block:
+    return `Continue after previousRequestId with established systemPrompt/tools. messages has ONLY new input or toolResults; calls run sequentially in order (e.g. [edit, bash]).
+Reply using NEW requestId "${payload.requestId}" (NOT previousRequestId), wrapped in a \`\`\`json code block (required to preserve backslashes/quotes):
 <<<COPILOT_REPLY_START:${payload.requestId}>>>
-{"requestId":"${payload.requestId}","type":"final","lines":[...]} OR {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"...","arguments":{}}]}
+\`\`\`json
+{"requestId":"${payload.requestId}","type":"final","lines":[...]}
+\`\`\`
 <<<COPILOT_REPLY_END:${payload.requestId}>>>
+(Or {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"...","arguments":{}}]} inside \`\`\`json.)
 TASK_CONTEXT_JSON:
 ${JSON.stringify(payload)}`;
   }
 
   if (payload.mode === 'repair') {
-    return `FORMAT CORRECTION for replacesRequestId: your previous reply violated the response format, so NO local tools ran. Fix formatIssue and emit the same intended response using the NEW requestId below. Do not invent tool results.
-Reply with exact markers and ONE single-line fenced json block (for final, use "lines": one Markdown line per array item, no literal \\n breaks; escape JSON strings once):
+    return `FORMAT CORRECTION for replacesRequestId: your previous reply violated the response format, so NO local tools ran. Fix formatIssue and emit the same intended response using NEW requestId "${payload.requestId}". Do not invent tool results.
+Wrap ONE single-line JSON object inside a \`\`\`json code fence (required so webpage Markdown does not strip backslashes; for final use "lines" array with one Markdown line per item):
 <<<COPILOT_REPLY_START:${payload.requestId}>>>
-{"requestId":"${payload.requestId}","type":"final","lines":["..."]} OR {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]}
+\`\`\`json
+{"requestId":"${payload.requestId}","type":"final","lines":["..."]}
+\`\`\`
 <<<COPILOT_REPLY_END:${payload.requestId}>>>
+(Or {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]} inside \`\`\`json.)
 TASK_CONTEXT_JSON:
 ${JSON.stringify(payload)}`;
   }
@@ -209,11 +215,16 @@ QUOTA EFFICIENCY (daily turns are scarce):
 - calls execute SEQUENTIALLY in array order: chain dependent edits and verification in ONE turn (e.g. [edit, bash("npm test")]).
 - Read files <300 lines whole in one read call; use preloaded context directly without re-reading. Never waste a turn narrating planned tool calls.
 Implementation tasks require actual tool execution and verification (a plan or snippet for the user to paste is not completion). Answer questions directly without unnecessary edits.
-Reply format — exact markers on their own lines wrapping ONE fenced json block on ONE physical line:
+Reply format — exact markers on their own lines wrapping ONE \`\`\`json fenced code block containing ONE single-line JSON object (the \`\`\`json fence is REQUIRED so webpage Markdown preserves escaped quotes/backslashes):
 <<<COPILOT_REPLY_START:${payload.requestId}>>>
+\`\`\`json
 {"requestId":"${payload.requestId}","type":"final","lines":["first paragraph","","next paragraph"]}
-{"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]}
+\`\`\`
 <<<COPILOT_REPLY_END:${payload.requestId}>>>
+Or for tool calls (inside the same markers and \`\`\`json fence):
+\`\`\`json
+{"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]}
+\`\`\`
 Rules: final uses "lines" (one Markdown line per string, "" for blank lines, code fences/lines as separate items; no literal \\n layout breaks; preserve intentional escapes). Escape JSON strings once (actual newlines in tool args -> \\n; literal \\n -> \\\\n). Copy requestId verbatim. Prefer forward slashes in Windows paths. No extra commentary outside the markers.
 TASK_CONTEXT_JSON:
 ${JSON.stringify(payload)}`;
@@ -257,13 +268,23 @@ function tryParseJsonRelaxed(raw) {
   }
 }
 
-export function parseReply(reply, requestId, tools, { allowPlainTextFinal = false } = {}) {
+function replySignatureOf(reply) {
+  return JSON.stringify(reply?.codeBlocks?.length ? reply.codeBlocks : [reply?.protocolText ?? reply?.text ?? '']);
+}
+
+export function parseReply(reply, requestId, tools, { allowPlainTextFinal = false, previousReplySignature = null } = {}) {
   if (reply.completed !== true) throw new Error('The webpage has not confirmed completion. No tools were executed.');
+  const isIdenticalStaleReply = Boolean(previousReplySignature) && replySignatureOf(reply) === previousReplySignature;
   let body = reply.protocolText ?? reply.text ?? '';
   const start = `<<<COPILOT_REPLY_START:${requestId}>>>`, end = `<<<COPILOT_REPLY_END:${requestId}>>>`;
   const hasMarkers = body.includes('<<<COPILOT_REPLY_');
   if (hasMarkers) {
-    if (!body.includes(start) && !body.includes(end)) throw new Error('Reply markers belong to a different request. No tools were executed.');
+    if (!body.includes(start) && !body.includes(end)) {
+      if (isIdenticalStaleReply) {
+        throw new Error('Reply markers belong to a different request. No tools were executed.');
+      }
+      throw formatError(`Reply markers did not match the current requestId "${requestId}". Copy "${requestId}" verbatim in both markers and JSON. No tools were executed.`);
+    }
     if (body.split(start).length !== 2 || body.split(end).length !== 2 || body.indexOf(end) < body.indexOf(start)) {
       throw formatError('Reply markers are incomplete or repeated. No tools were executed.');
     }
@@ -294,7 +315,12 @@ export function parseReply(reply, requestId, tools, { allowPlainTextFinal = fals
   if (packets.size > 1) throw new Error('The reply contains conflicting protocol objects for this request. No tools were executed.');
   if (packets.size && malformedCurrent) throw formatError('The reply contains both valid and malformed protocol objects. No tools were executed.');
   if (!packets.size) {
-    if (seenOtherRequest) throw new Error('The reply requestId does not match. No tools were executed.');
+    if (seenOtherRequest) {
+      if (isIdenticalStaleReply) {
+        throw new Error('The reply requestId does not match. No tools were executed.');
+      }
+      throw formatError(`The reply JSON requestId did not match "${requestId}". Return the exact current requestId "${requestId}". No tools were executed.`);
+    }
     // Quota saver: if the model answered directly in clean plain text (without attempting a broken
     // tool_calls envelope or markers), accept it locally as a final answer instead of spending a repair turn.
     const plain = (reply.text ?? '').trim();
@@ -302,7 +328,10 @@ export function parseReply(reply, requestId, tools, { allowPlainTextFinal = fals
     if (allowPlainTextFinal && plain && !looksLikeBrokenToolAttempt) {
       return { requestId, type: 'final', text: plain, recoveredPlainText: true };
     }
-    throw formatError(`Cannot parse the web reply as protocol JSON (code blocks=${reply.codeBlocks?.length ?? 0}, text=${reply.text?.length ?? 0} characters; ${syntax || 'no protocol object found'}). No tools were executed.`);
+    const missingFenceHint = (reply.codeBlocks?.length ?? 0) === 0
+      ? ' Missing ```json code fence caused webpage Markdown to strip escaped quotes/backslashes — wrap the single-line JSON inside ```json ... ```.'
+      : '';
+    throw formatError(`Cannot parse the web reply as protocol JSON (code blocks=${reply.codeBlocks?.length ?? 0}, text=${reply.text?.length ?? 0} characters; ${syntax || 'no protocol object found'}).${missingFenceHint} No tools were executed.`);
   }
   const packet = packets.values().next().value;
   if (packet.type === 'final') {
@@ -353,13 +382,16 @@ export function createCopilotProvider(browser, {
   control
 } = {}) {
   const implicitSession = randomUUID();
-  let lastTurn = null, busy = false, needsNewChat = false, webTurnsInTab = 0, webCharsInTab = 0;
+  let lastTurn = null, lastReplySignature = null, requestSeq = 0;
+  let busy = false, needsNewChat = false, webTurnsInTab = 0, webCharsInTab = 0;
   const tabReadCache = new Map();
   let pendingPreloads = [];
+  const nextRequestId = () => `r${++requestSeq}-${randomBytes(2).toString('hex')}`;
 
   if (control && typeof control === 'object') {
     control.resetWebConversation = () => {
       lastTurn = null;
+      lastReplySignature = null;
       needsNewChat = false;
       webTurnsInTab = 0;
       webCharsInTab = 0;
@@ -477,7 +509,7 @@ export function createCopilotProvider(browser, {
           };
         };
 
-        let requestId = randomUUID();
+        let requestId = nextRequestId();
         const initialPayload = continued
           ? {
             mode: 'continue',
@@ -494,6 +526,7 @@ export function createCopilotProvider(browser, {
 
         const ask = async (payload, fresh, { overridePreference, toolResultTurn = isToolResultTurn } = {}) => {
           if (fresh) {
+            lastReplySignature = null;
             tabReadCache.clear();
             for (const entry of pendingPreloads) tabReadCache.set(entry.key, entry);
             pendingPreloads = [];
@@ -520,6 +553,7 @@ export function createCopilotProvider(browser, {
               signal: options.signal,
               fresh,
               requireContinuation: !fresh,
+              previousRequestId: !fresh ? (payload.previousRequestId ?? payload.replacesRequestId ?? lastTurn?.requestId) : undefined,
               modelPreference: effectivePref,
               turnContext,
               onStatus,
@@ -561,7 +595,7 @@ export function createCopilotProvider(browser, {
             } else if (!fresh && error?.beforeSend === true && error?.retryableInFreshChat === true && !options.signal?.aborted) {
               await onActivity('recovery_retry', { sessionId, reason: error.code ?? error.message });
               onStatus('Web conversation lost before Send; restoring local context in a fresh chat...');
-              current = await buildBootstrapPayload(randomUUID(), { resumed: true });
+              current = await buildBootstrapPayload(nextRequestId(), { resumed: true });
               response = await ask(current, true);
             } else {
               throw error;
@@ -577,12 +611,12 @@ export function createCopilotProvider(browser, {
               await onThinkLimited();
               await onActivity('quota_downgrade', { sessionId, from: 'think', to: 'quick', excerpt: limitNotice.excerpt });
               onStatus('Think deeper reached daily limit; switching to quick and continuing in a fresh chat...');
-              current = await buildBootstrapPayload(randomUUID(), { resumed: rawMessages.length > 1 });
+              current = await buildBootstrapPayload(nextRequestId(), { resumed: rawMessages.length > 1 });
               response = await ask(current, true, { overridePreference: { kind: 'preset', name: 'quick' }, toolResultTurn: true });
             } else if (limitNotice.kind === 'conversation_limit') {
               await onActivity('conversation_limit_rotate', { sessionId, excerpt: limitNotice.excerpt });
               onStatus('Web conversation hit M365 turn limit; restoring local context in a fresh chat...');
-              current = await buildBootstrapPayload(randomUUID(), { resumed: rawMessages.length > 1 });
+              current = await buildBootstrapPayload(nextRequestId(), { resumed: rawMessages.length > 1 });
               response = await ask(current, true);
             } else if (limitNotice.kind === 'daily_limit') {
               throw new Error(`Microsoft 365 Copilot reported a daily usage limit (${limitNotice.excerpt}). Try /model quick or /model auto.`);
@@ -593,10 +627,12 @@ export function createCopilotProvider(browser, {
           for (let correction = 0; ; correction++) {
             options.signal?.throwIfAborted();
             try {
-              return {
-                packet: parseReply(reply, current.requestId, tools, { allowPlainTextFinal }),
-                requestId: current.requestId
-              };
+              const packet = parseReply(reply, current.requestId, tools, {
+                allowPlainTextFinal,
+                previousReplySignature: lastReplySignature
+              });
+              lastReplySignature = replySignatureOf(reply);
+              return { packet, requestId: current.requestId };
             } catch (error) {
               if (error.code !== 'COPILOT_REPLY_FORMAT' || correction === 1) {
                 postSendUncertain = true;
@@ -604,7 +640,7 @@ export function createCopilotProvider(browser, {
               }
               onStatus('Correcting reply format...');
               current = {
-                mode: 'repair', requestId: randomUUID(), sessionId, replacesRequestId: current.requestId,
+                mode: 'repair', requestId: nextRequestId(), sessionId, replacesRequestId: current.requestId,
                 formatIssue: error.message, tools: wireTools
               };
               reply = (await ask(current, false, { toolResultTurn: true })).reply;

@@ -5,6 +5,14 @@ import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 const IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'vendor', '__pycache__', '.venv']);
+const SKIP_PRELOAD_EXTS = new Set([
+  '.jar', '.war', '.ear', '.zip', '.tar', '.gz', '.tgz', '.7z', '.rar', '.class',
+  '.exe', '.dll', '.so', '.dylib', '.bin', '.obj', '.o', '.a',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.pdf',
+  '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.mov', '.avi',
+  '.sqlite', '.db', '.pyc', '.pyo'
+]);
+const SKIP_AUTO_FILENAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'Cargo.lock', 'poetry.lock']);
 const MAX_SNAPSHOT_FILES = 75;
 const MAX_SNAPSHOT_CHARS = 3500;
 const MAX_PRELOAD_FILES = 4;
@@ -102,7 +110,7 @@ export async function collectWorkspaceSnapshot(cwd, { maxChars = MAX_SNAPSHOT_CH
 }
 
 // Match @path/to/file or @path/to/file:10-80 preceded by start-of-string, whitespace, or CJK/punctuation (never emails).
-const FILE_MENTION = /(?:^|[\s([{"'`，。！？、；：])@([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)(?::(\d+)(?:-(\d+))?)?/g;
+const FILE_MENTION = /(?:^|[\s([{"'`，。！？、；：（）《》【】])@([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)(?::(\d+)(?:-(\d+))?)?/g;
 // Match plain relative workspace file paths (e.g. src/browser.js, package.json, test/a.js:10-40) without needing @.
 // Avoids URLs, emails, and path fragments preceded by @, :, /, or alphanumeric chars.
 const PLAIN_FILE_PATH = /(?<![A-Za-z0-9_@:/\\.-])((?:\.[\\/])?(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{1,10})(?::(\d+)(?:-(\d+))?)?(?![A-Za-z0-9_/.:-])/g;
@@ -149,7 +157,11 @@ export async function expandFileMentions(prompt, cwd, {
     const rel = relative(root, target);
     if (!rel || rel === '..' || rel.startsWith('..') || isAbsolute(rel)) return;
     const displayPath = rel.replaceAll('\\', '/');
-    if (!explicit && hasIgnoredSegment(displayPath)) return;
+    const lowerBase = displayPath.split('/').at(-1)?.toLowerCase() ?? '';
+    const dotIdx = lowerBase.lastIndexOf('.');
+    const ext = dotIdx >= 0 ? lowerBase.slice(dotIdx) : '';
+    if (SKIP_PRELOAD_EXTS.has(ext)) return;
+    if (!explicit && (hasIgnoredSegment(displayPath) || SKIP_AUTO_FILENAMES.has(lowerBase))) return;
 
     const key = `${displayPath}:${startLine ?? ''}:${endLine ?? ''}`;
     if (seenKeys.has(key)) return;

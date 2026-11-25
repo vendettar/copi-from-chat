@@ -52,6 +52,12 @@ test('role markdown transformer distinguishes You vs Copi and toolHistory tracks
   const transform = createRoleMarkdownTransformer({ getModelTag: () => 'quick' });
   const userOut = transform('Fix the bug.', { messageType: 'user' });
   assert.match(userOut, /^\*\*▌ You\*\*\n\nFix the bug\.$/);
+  const preloadedUser = transform(
+    'Check src/app.js\n\n[Preloaded file context — already read locally, no need to re-read these sections]\n--- src/app.js ---\nconst huge = 1;',
+    { messageType: 'user' }
+  );
+  assert.match(preloadedUser, /Check src\/app\.js[\s\S]*Preloaded locally: `src\/app\.js`/);
+  assert.doesNotMatch(preloadedUser, /const huge = 1/);
   const assistantOut = transform('Done.', { messageType: 'assistant' });
   assert.match(assistantOut, /^---\n\*\*▌ Copi\*\* `quick`\n\nDone\.$/);
   // Idempotent when called again.

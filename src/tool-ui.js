@@ -28,7 +28,7 @@ export function extractResultText(result) {
 export function summarizeToolCall(toolName, args = {}) {
   if (!args || typeof args !== 'object') return toolName;
   if (toolName === 'bash') {
-    return `bash ${singleLine(args.command ?? '', 90)}`;
+    return `bash ${singleLine(args.command ?? '', 68)}`;
   }
   if (toolName === 'read') {
     const target = String(args.path ?? '').replaceAll('\\', '/');
@@ -106,11 +106,8 @@ export function wrapCompactToolRenderer(name, baseRenderer) {
           ? theme.fg('error', '✗')
           : theme.fg('success', '✓');
       const title = summarizeToolCall(name, args);
-      const timing = !context.isPartial && context.durationMs !== undefined
-        ? theme.fg('dim', ` · ${formatDuration(context.durationMs)}`)
-        : '';
-      const hint = !context.isPartial ? theme.fg('dim', ' (Ctrl+O / click)') : '';
-      return new Text(`${icon} ${theme.fg('toolTitle', title)}${timing}${hint}`, 0, 0);
+      const hint = !context.isPartial ? theme.fg('dim', ' (Ctrl+O)') : '';
+      return new Text(`${icon} ${theme.fg('toolTitle', title)}${hint}`, 0, 0);
     },
     renderResult(result, options, theme, context) {
       if (options.expanded && baseRenderer.renderResult) {
@@ -136,6 +133,17 @@ function formatShortTime(timestamp) {
   return `${hh}:${mm}`;
 }
 
+const DISPLAY_PRELOAD_BLOCK = /\n\n\[Preloaded @?file context — [^\]]+\]\n([\s\S]*)$/;
+
+function collapsePreloadForDisplay(markdown) {
+  const match = DISPLAY_PRELOAD_BLOCK.exec(markdown);
+  if (!match) return markdown;
+  const userText = markdown.slice(0, match.index);
+  const files = [...match[1].matchAll(/^--- @?(.+?) ---$/gm)].map(m => m[1].trim()).filter(Boolean);
+  if (!files.length) return userText;
+  return `${userText}\n\n> Preloaded locally: ${files.map(f => `\`${f}\``).join(', ')}`;
+}
+
 export function createRoleMarkdownTransformer({ getModelTag = () => 'think' } = {}) {
   return (markdown, context = {}) => {
     if (typeof markdown !== 'string' || !markdown.trim()) return markdown;
@@ -144,7 +152,7 @@ export function createRoleMarkdownTransformer({ getModelTag = () => 'think' } = 
 
     if (context.messageType === 'user') {
       if (markdown.startsWith('**▌ You')) return markdown;
-      return `**▌ You${timeSuffix}**\n\n${markdown}`;
+      return `**▌ You${timeSuffix}**\n\n${collapsePreloadForDisplay(markdown)}`;
     }
 
     if (context.messageType === 'assistant') {

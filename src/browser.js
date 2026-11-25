@@ -592,7 +592,7 @@ export class CopilotTab {
     }
   }
 
-  async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, turnContext = {}, onSnapshot = () => {}, onStatus = () => {}, onEvent = () => {} } = {}) {
+  async ask(message, { signal, fresh = false, requireContinuation = false, previousRequestId, modelPreference, turnContext = {}, onSnapshot = () => {}, onStatus = () => {}, onEvent = () => {} } = {}) {
     if (this.busy) throw tagError(new Error('A browser request is already in progress.'), { beforeSend: true });
     if (this.uncertain && !fresh) {
       throw new Error('The previous exchange is uncertain. Start a new web conversation before sending another request.');
@@ -805,7 +805,6 @@ export class CopilotTab {
           const reply = await replies.evaluateAll(readReply, previous);
           const replyChanged = reply.count !== previousCount
             || reply.text !== previousText
-            || (reply.count > 0 && reply.fresh)
             || replyFingerprint(reply) !== previousSignature;
           const generating = stopVisible || reply.busy;
           const editorCleared = composerState.count === 1 && !normalize(composerState.text);
@@ -883,10 +882,10 @@ export class CopilotTab {
           );
         }
 
-        return { page, replies, stop, previous, previousCount, previousText };
+        return { page, replies, stop, previous, previousCount, previousText, previousSignature };
       });
 
-      const { page, replies, stop, previous, previousCount, previousText } = sendContext;
+      const { page, replies, stop, previous, previousCount, previousText, previousSignature } = sendContext;
       onStatus('Waiting for Copilot...');
       const thinkingIndicator = page.locator('[data-testid*="thought" i]:visible, [data-testid*="reason" i]:visible, [aria-label*="thinking" i]:visible, [aria-label*="思考"]:visible').first();
 
@@ -901,7 +900,17 @@ export class CopilotTab {
         const stopVisible = await stop.isVisible();
         const generating = stopVisible || reply.busy;
         sawGenerating ||= generating;
-        const current = reply.text.trim() && (reply.count > previousCount || reply.text !== previousText || (sawGenerating && reply.fresh));
+        // Guard against React remounts/re-renders of the previous assistant bubble (e.g. after
+        // switching think -> quick): never mistake the previous bubble's unchanged fingerprint or
+        // stale previousRequestId marker for the new turn's reply while reply.count <= previousCount.
+        const currentSignature = replyFingerprint(reply);
+        const sameBubbleUnchanged = previousCount > 0 && reply.count <= previousCount && currentSignature === previousSignature;
+        const sameBubbleStaleMarker = Boolean(previousRequestId)
+          && reply.count <= previousCount
+          && (reply.protocolText ?? reply.text ?? '').includes(`<<<COPILOT_REPLY_START:${previousRequestId}>>>`);
+        const hasNewReply = !sameBubbleUnchanged && !sameBubbleStaleMarker
+          && (reply.count > previousCount || reply.text !== previousText);
+        const current = Boolean(reply.text.trim()) && hasNewReply;
         if (generating && !current && !reportedThinking) {
           const isThinking = await thinkingIndicator.isVisible().catch(() => false);
           if (isThinking) {

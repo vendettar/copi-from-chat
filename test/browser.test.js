@@ -156,6 +156,31 @@ async function fixture(t, config = {}) {
           return;
         }
         const stop = document.getElementById('stop');
+        if (config.remountPreviousOnSecondSend && window.sent.length === 2) {
+          // Simulate M365 React remounting the previous assistant bubble + flashing Stop before appending the real reply 2.
+          const repliesEl = document.getElementById('replies');
+          const oldBubble = repliesEl.lastElementChild;
+          if (oldBubble) {
+            const clone = oldBubble.cloneNode(true);
+            oldBubble.replaceWith(clone);
+          }
+          stop.hidden = false;
+          setTimeout(() => { stop.hidden = true; }, 120);
+          setTimeout(() => {
+            stop.hidden = false;
+            const reply2 = document.createElement('article');
+            reply2.setAttribute('data-message-author-role', 'assistant');
+            reply2.setAttribute('aria-busy', 'true');
+            reply2.textContent = 'Generating 2';
+            repliesEl.append(reply2);
+            setTimeout(() => {
+              reply2.textContent = '<<<COPILOT_REPLY_START:r2-new>>>\\nReply 2\\n<<<COPILOT_REPLY_END:r2-new>>>';
+              reply2.setAttribute('aria-busy', 'false');
+              stop.hidden = true;
+            }, 80);
+          }, 500);
+          return;
+        }
         stop.hidden = false;
         const reply = document.createElement('article');
         reply.setAttribute('data-message-author-role', 'assistant');
@@ -163,7 +188,7 @@ async function fixture(t, config = {}) {
         reply.textContent = 'Thinking';
         document.getElementById('replies').append(reply);
         setTimeout(() => {
-          reply.textContent = 'Reply ' + window.sent.length;
+          reply.textContent = config.firstReplyText && window.sent.length === 1 ? config.firstReplyText : ('Reply ' + window.sent.length);
           reply.setAttribute('aria-busy', 'false');
           stop.hidden = true;
         }, 80);
@@ -465,4 +490,25 @@ test('detects M365 [role="alert"] daily-limit banners both after Send and when S
     b2.ask('Blocked by limit toast.', { fresh: true }),
     error => error.code === 'COPILOT_WEB_LIMIT' && error.beforeSend === true && error.limitNotice?.kind === 'daily_limit'
   );
+});
+
+test('ignores a remounted stale previous assistant bubble during continuation and waits for the real new reply', async t => {
+  const browser = await fixture(t, {
+    initialIndex: 2,
+    firstReplyText: '<<<COPILOT_REPLY_START:r1-old>>>\nOld tool reply\n<<<COPILOT_REPLY_END:r1-old>>>',
+    remountPreviousOnSecondSend: true
+  });
+  if (!browser) return;
+
+  const first = await browser.ask('Turn 1.', { fresh: true });
+  assert.match(first.text, /r1-old/);
+
+  const second = await browser.ask('Turn 2 tool result.', {
+    requireContinuation: true,
+    previousRequestId: 'r1-old',
+    modelPreference: 'quick'
+  });
+  assert.equal(second.completed, true);
+  assert.match(second.text, /r2-new/);
+  assert.doesNotMatch(second.text, /r1-old/);
 });
