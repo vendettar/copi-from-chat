@@ -45,9 +45,12 @@ export function getCopiPaths(home = getCopiHome()) {
     },
     activityLog: join(root, 'activity.jsonl'),
     checkpointsDir: join(root, 'checkpoints'),
+    snapshotsDir: join(root, 'checkpoints', 'snapshots'),
+    promptsDir: join(root, 'prompts'),
     locksDir: join(root, 'locks'),
     browserHostFile: join(root, 'browser-host.json'),
     configFile: join(root, 'config.json'),
+    quotaFile: join(root, 'quota.json'),
     inputDiagnosticFile: join(root, 'input-diagnostic.json')
   };
 }

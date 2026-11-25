@@ -56,6 +56,30 @@ export async function findRunningBrowserHost(paths = getCopiPaths(), { signal } 
   return null;
 }
 
+export async function getBrowserHostHealth(paths = getCopiPaths(), { signal } = {}) {
+  const info = await readHostDescriptor(paths);
+  if (!info) return { running: false, descriptor: null, health: null };
+  const health = await checkHostHealth(info, { signal });
+  if (!health) return { running: false, stale: true, descriptor: info, health: null };
+  return { running: true, stale: false, descriptor: info, health };
+}
+
+export async function stopBrowserHost(paths = getCopiPaths(), { signal } = {}) {
+  const status = await getBrowserHostHealth(paths, { signal });
+  if (!status.running) {
+    if (status.stale) await unlink(paths.browserHostFile).catch(() => {});
+    return { stopped: false, wasRunning: false };
+  }
+  try {
+    await fetch(hostUrl(status.descriptor, '/shutdown'), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${status.descriptor.token}` },
+      signal
+    });
+  } catch { /* host may exit immediately */ }
+  return { stopped: true, wasRunning: true, pid: status.descriptor.pid, port: status.descriptor.port };
+}
+
 export async function ensureBrowserHost(paths = getCopiPaths(), {
   signal,
   spawnHost,
@@ -256,7 +280,18 @@ export class SharedBrowserClient {
     }
   }
 
-  async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, onSnapshot = () => {}, onStatus = () => {} } = {}) {
+  async inspectDomHealth({ signal } = {}) {
+    const info = await this._connect({ startIfMissing: false, signal });
+    if (!info) return { pageOpen: false, composerCount: 0, sendButtonVisible: false, pickerFound: false, replyCount: 0 };
+    try {
+      const response = await this._request(info, 'GET', `/sessions/${encodeURIComponent(this.sessionId)}/dom-health`, undefined, { signal });
+      return await response.json();
+    } catch {
+      return { pageOpen: false, composerCount: 0, sendButtonVisible: false, pickerFound: false, replyCount: 0 };
+    }
+  }
+
+  async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, turnContext, onSnapshot = () => {}, onStatus = () => {} } = {}) {
     if (this.busy) {
       throw Object.assign(new Error('A browser request is already in progress.'), { beforeSend: true });
     }
@@ -301,7 +336,8 @@ export class SharedBrowserClient {
           message,
           fresh,
           requireContinuation,
-          modelPreference: modelPreference !== undefined ? parseModelPreference(modelPreference) : this.modelPreference
+          modelPreference: modelPreference !== undefined ? parseModelPreference(modelPreference) : this.modelPreference,
+          ...(turnContext !== undefined ? { turnContext } : {})
         }),
         signal: controller.signal
       });

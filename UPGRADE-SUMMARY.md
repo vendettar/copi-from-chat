@@ -4,7 +4,9 @@ Summary of the transformation from `copilot-from-chat-poc` (`copilot`) to standa
 
 ## Package & CLI
 
-- Renamed package from `copilot-from-chat-poc` (bin `copilot`) to `copi-from-chat` (bin `copi`), keeping `private: true` to prevent accidental `npm publish` while packaging cleanly via `npm pack` (`npm install -g ./copi-from-chat-0.0.9.tgz`).
+- Renamed package from `copilot-from-chat-poc` (bin `copilot`) to `copi-from-chat` (bin `copi`), keeping `private: true` to prevent accidental `npm publish` while packaging cleanly via `npm pack` (`npm install -g ./copi-from-chat-0.1.0.tgz`).
+- Added Quota-Saver Engine (`v0.1.0`): `smart` model tiering (`think` on main prompts, `quick` on tool-result follow-ups), one-shot `/think <prompt>`, daily turn tracking & automatic downgrade on `Think deeper` daily limit (`~/.copi/quota.json`), zero-turn workspace pre-context + `@file` preloading + piped `stdin`, aggressive multi-tool batching contract, zero-cost local JS/JSON post-edit syntax checks, zero-cost plain-text/trailing-comma final recovery, and proactive web tab rotation before M365 per-chat limits.
+- Added `/undo` per-turn file snapshots, `--readonly` / `/readonly` exploration mode, custom prompt templates (`/review`, `/commit`, `/fix`, `~/.copi/prompts/*.md`, `.copi/prompts/*.md`), bounded non-Git fallback for `grep`/`find`, `/export` Markdown reports, `copi doctor` / `/doctor`, `copi host status|stop` (+ optional `hostIdleMinutes`), and `copi sessions`.
 - Lowered `engines.node` to `>=20.0.0` and added `npm run check` (`src/check.js`).
 - Added CLI flags `-c/--continue`, `-s/--session <id>`, `-m/--model <auto|quick|think|index>`, `-y/--yes`, `--no-bell`, `--profile <name>`, and `-v/--version`, plus Git Bash POSIX path normalization (`/c/...` -> `C:/...`) and extended Git Bash auto-detection on Windows.
 - Interactive mode eagerly opens the shared Edge window on startup so Microsoft 365 login happens immediately and `/model` can inspect live webpage options right away.

@@ -4,7 +4,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { getCopiPaths } from './paths.js';
 import {
-  DEFAULT_MODEL_PREFERENCE, modelPreferenceKey, parseModelPreference, resolveCandidateIndices
+  DEFAULT_MODEL_PREFERENCE, modelPreferenceKey, parseModelPreference,
+  resolveCandidateIndices, resolveEffectivePreference
 } from './model-preference.js';
 
 export const CHAT_URL = 'https://m365.cloud.microsoft/chat';
@@ -440,17 +441,37 @@ export class CopilotTab {
     };
   }
 
-  async selectModel({ signal, onStatus = () => {}, preference } = {}) {
+  async inspectDomHealth() {
+    if (!this.page || this.page.isClosed()) {
+      return { pageOpen: false, composerCount: 0, sendButtonVisible: false, pickerFound: false, replyCount: 0 };
+    }
+    const { findPicker } = this._modelHelpers(this.page);
+    const [composerCount, sendButtonVisible, picker, replyCount] = await Promise.all([
+      this.page.locator(INPUT).count().catch(() => 0),
+      this.page.getByRole('button', { name: /^(send(?: message)?|发送|傳送)$/i }).filter({ visible: true }).count().then(c => c > 0).catch(() => false),
+      findPicker().then(Boolean).catch(() => false),
+      this.page.locator(RESPONSES).count().catch(() => 0)
+    ]);
+    return {
+      pageOpen: true,
+      composerCount,
+      sendButtonVisible,
+      pickerFound: picker,
+      replyCount
+    };
+  }
+
+  async selectModel({ signal, onStatus = () => {}, preference, turnContext = {} } = {}) {
     // Maximum-compatibility, index-based model selection:
     // M365 Copilot regularly changes model labels and switches between Chinese and English UI
     // (e.g., [自动, 快速响应, 深度思考] vs [Auto, Quick response, Think deeper] or nested submenus).
     // Never match menu options by hardcoded model name and never fail the turn if selection is
-    // unavailable. Resolve candidate indices from preference (think/quick/auto/index) and fall back
+    // unavailable. Resolve candidate indices from preference (smart/think/quick/auto/index) and fall back
     // gracefully across valid options without throwing (worst case: current/Auto model).
     signal?.throwIfAborted();
-    const targetPref = parseModelPreference(preference ?? this.modelPreference);
+    const targetPref = resolveEffectivePreference(preference ?? this.modelPreference, turnContext);
     const page = this.page;
-    if (!page || page.isClosed()) return { selected: false, fallback: true, reason: 'no_page' };
+    if (!page || page.isClosed()) return { selected: false, fallback: true, reason: 'no_page', effectivePreference: targetPref };
 
     const { menus, read, readMenuItems, wait, findPicker, closeMenus, ensureTopMenuOpen } = this._modelHelpers(page, signal);
     let touchedMenu = false;
@@ -554,7 +575,7 @@ export class CopilotTab {
     }
   }
 
-  async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, onSnapshot = () => {}, onStatus = () => {}, onEvent = () => {} } = {}) {
+  async ask(message, { signal, fresh = false, requireContinuation = false, modelPreference, turnContext = {}, onSnapshot = () => {}, onStatus = () => {}, onEvent = () => {} } = {}) {
     if (this.busy) throw tagError(new Error('A browser request is already in progress.'), { beforeSend: true });
     if (this.uncertain && !fresh) {
       throw new Error('The previous exchange is uncertain. Start a new web conversation before sending another request.');
@@ -620,9 +641,10 @@ export class CopilotTab {
             await this.page.locator(RESPONSES).first().waitFor({ state: 'hidden', timeout: 15000 });
           }
         }
-        const desiredModelKey = modelPreferenceKey(this.modelPreference);
+        const effectivePref = resolveEffectivePreference(this.modelPreference, turnContext);
+        const desiredModelKey = modelPreferenceKey(effectivePref);
         if (fresh || !this.used || this.appliedModelKey !== desiredModelKey) {
-          await this.selectModel({ signal, onStatus, preference: this.modelPreference });
+          await this.selectModel({ signal, onStatus, preference: effectivePref, turnContext });
         }
         if (fresh) this.uncertain = false;
 
@@ -841,8 +863,9 @@ export class CopilotTab {
 
       const { page, replies, stop, previous, previousCount, previousText } = sendContext;
       onStatus('Waiting for Copilot...');
+      const thinkingIndicator = page.locator('[data-testid*="thought" i]:visible, [data-testid*="reason" i]:visible, [aria-label*="thinking" i]:visible, [aria-label*="思考"]:visible').first();
 
-      let sawGenerating = false, lastText = '';
+      let sawGenerating = false, reportedThinking = false, lastText = '';
       let candidate = '', candidateSince = 0;
       const deadline = Date.now() + this.replyTimeoutMs;
       while (Date.now() < deadline) {
@@ -852,6 +875,13 @@ export class CopilotTab {
         const generating = stopVisible || reply.busy;
         sawGenerating ||= generating;
         const current = reply.text.trim() && (reply.count > previousCount || reply.text !== previousText || (sawGenerating && reply.fresh));
+        if (generating && !current && !reportedThinking) {
+          const isThinking = await thinkingIndicator.isVisible().catch(() => false);
+          if (isThinking) {
+            onStatus('Copilot is thinking deeply...');
+            reportedThinking = true;
+          }
+        }
         if (current && reply.text !== lastText) {
           await onSnapshot(reply);
           lastText = reply.text;
@@ -963,6 +993,13 @@ export class CopilotBrowser {
       return { state: 'disconnected', ready: false, open: false, busy: this.busy, uncertain: this.uncertain, activeModel: this.lastSelectedModel };
     }
     return this.tab.getStatus();
+  }
+
+  async inspectDomHealth() {
+    if (!this.context) {
+      return { pageOpen: false, composerCount: 0, sendButtonVisible: false, pickerFound: false, replyCount: 0 };
+    }
+    return this.tab.inspectDomHealth();
   }
 
   async hasContinuation() {

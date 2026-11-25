@@ -1,6 +1,11 @@
-export const DEFAULT_MODEL_PREFERENCE = Object.freeze({ kind: 'preset', name: 'think' });
+export const DEFAULT_MODEL_PREFERENCE = Object.freeze({ kind: 'preset', name: 'smart' });
 
 const PRESET_ALIASES = new Map([
+  ['smart', 'smart'],
+  ['quota', 'smart'],
+  ['saver', 'smart'],
+  ['智能', 'smart'],
+  ['省额度', 'smart'],
   ['auto', 'auto'],
   ['first', 'auto'],
   ['default', 'auto'],
@@ -24,7 +29,7 @@ const PRESET_ALIASES = new Map([
 export function parseModelPreference(input) {
   if (input === undefined || input === null || input === '') return DEFAULT_MODEL_PREFERENCE;
   if (typeof input === 'object' && !Array.isArray(input)) {
-    if (input.kind === 'preset' && ['auto', 'quick', 'think'].includes(input.name)) {
+    if (input.kind === 'preset' && ['smart', 'auto', 'quick', 'think'].includes(input.name)) {
       return { kind: 'preset', name: input.name };
     }
     if (input.kind === 'index' && Number.isInteger(input.index) && input.index >= 0) {
@@ -44,7 +49,7 @@ export function parseModelPreference(input) {
   if (/^\d+$/.test(raw)) {
     return { kind: 'index', index: Number(raw) };
   }
-  throw new Error(`Invalid model "${input}". Use auto, quick, think, or a 0-based menu index (e.g. 0, 1, 2).`);
+  throw new Error(`Invalid model "${input}". Use smart, auto, quick, think, or a 0-based menu index (e.g. 0, 1, 2).`);
 }
 
 export function formatModelPreference(preference) {
@@ -55,6 +60,20 @@ export function formatModelPreference(preference) {
 export function modelPreferenceKey(preference) {
   const pref = parseModelPreference(preference);
   return pref.kind === 'preset' ? `preset:${pref.name}` : `index:${pref.index}`;
+}
+
+// Resolve effective single-turn tier from a preference + turn context (used for smart quota tiering).
+export function resolveEffectivePreference(preference, { isToolResultTurn = false, thinkLimited = false } = {}) {
+  const pref = parseModelPreference(preference);
+  if (pref.kind === 'index') return pref;
+  if (pref.name === 'smart') {
+    if (isToolResultTurn || thinkLimited) return { kind: 'preset', name: 'quick' };
+    return { kind: 'preset', name: 'think' };
+  }
+  if (pref.name === 'think' && thinkLimited) {
+    return { kind: 'preset', name: 'quick' };
+  }
+  return pref;
 }
 
 export function presetAliasForIndex(index, total) {
@@ -68,20 +87,20 @@ export function presetAliasForIndex(index, total) {
 
 // Resolve pure positional fallback indices for a menu of `length` enabled items.
 // Always falls back gracefully across valid indices so selection never fails on menu updates.
-export function resolveCandidateIndices(length, preference = DEFAULT_MODEL_PREFERENCE) {
+export function resolveCandidateIndices(length, preference = DEFAULT_MODEL_PREFERENCE, context = {}) {
   if (!Number.isInteger(length) || length <= 0) return [];
-  const pref = parseModelPreference(preference);
+  const effective = resolveEffectivePreference(preference, context);
   let raw;
-  if (pref.kind === 'index') {
-    raw = pref.index < length
-      ? [pref.index, length - 1, length - 2, 0]
+  if (effective.kind === 'index') {
+    raw = effective.index < length
+      ? [effective.index, length - 1, length - 2, 0]
       : [length - 1, length - 2, 0];
-  } else if (pref.name === 'auto') {
+  } else if (effective.name === 'auto') {
     raw = [0, 1, length - 1];
-  } else if (pref.name === 'quick') {
+  } else if (effective.name === 'quick') {
     raw = length >= 3 ? [1, length - 2, 0, length - 1] : [0, length - 1];
   } else {
-    // 'think' (default): last -> second-to-last -> first
+    // 'think': last -> second-to-last -> first
     raw = [length - 1, length - 2, 0];
   }
   return [...new Set(raw.filter(index => index >= 0 && index < length))];
@@ -89,8 +108,9 @@ export function resolveCandidateIndices(length, preference = DEFAULT_MODEL_PREFE
 
 export function getBuiltinModelPresets() {
   return [
+    { value: 'smart', label: 'smart', description: 'Quota-saver (default): think on main prompt, quick on tool-result follow-ups' },
+    { value: 'quick', label: 'quick', description: 'Second option (index 1 — e.g. 快速响应 / Quick response; saves daily limit)' },
     { value: 'auto', label: 'auto', description: 'First option (index 0 — e.g. 自动 / Auto)' },
-    { value: 'quick', label: 'quick', description: 'Second option (index 1 — e.g. 快速响应 / Quick response)' },
-    { value: 'think', label: 'think', description: 'Last option (default — e.g. 深度思考 / Think deeper)' }
+    { value: 'think', label: 'think', description: 'Last option (always 深度思考 / Think deeper)' }
   ];
 }

@@ -14,12 +14,21 @@ import {
   parseModelPreference, presetAliasForIndex
 } from './model-preference.js';
 import { createCopilotProvider } from './pi-provider.js';
+import { collectWorkspaceSnapshot, expandFileMentions } from './precontext.js';
+import { loadPromptTemplates } from './prompts.js';
+import { markThinkLimitedToday, readTodayQuota, recordWebTurn } from './quota.js';
 import { createWebUI } from './web-ui.js';
 import { createSearchTools } from './search-tools.js';
 import {
   acquireProfileLock, acquireSessionLock, logActivity,
   readConfig, readIncompleteCheckpoints, saveConfig
 } from './storage.js';
+
+const RESERVED_COMMANDS = new Set([
+  'new', 'resume', 'quit', 'exit', 'model', 'think', 'quota', 'undo', 'readonly',
+  'doctor', 'export', 'inspect', 'copy', 'diff', 'status', 'rename', 'reconnect',
+  'cleanup', 'bell', 'web', 'help', 'settings', 'compact', 'fork', 'tree', 'clone', 'import'
+]);
 
 function pathAccessible(filePath) {
   try {
@@ -57,6 +66,7 @@ const SELECT_THEME = {
 
 export function createModelController({ copiPaths, initialPreference = DEFAULT_MODEL_PREFERENCE } = {}) {
   let preference = parseModelPreference(initialPreference);
+  let oneShotPreference = null;
   let activeBrowser = null;
   let lastSelectedLabel = null;
   const listeners = new Set();
@@ -69,7 +79,17 @@ export function createModelController({ copiPaths, initialPreference = DEFAULT_M
 
   return {
     getPreference: () => preference,
+    getEffectiveDisplayPreference: () => oneShotPreference ?? preference,
     getLastSelectedLabel: () => activeBrowser?.lastSelectedModel ?? lastSelectedLabel,
+    setOneShotPreference(pref) {
+      oneShotPreference = parseModelPreference(pref);
+      notifyChange();
+    },
+    clearOneShotPreference() {
+      if (!oneShotPreference) return;
+      oneShotPreference = null;
+      notifyChange();
+    },
     onChange(fn) {
       listeners.add(fn);
       return () => listeners.delete(fn);
@@ -91,6 +111,7 @@ export function createModelController({ copiPaths, initialPreference = DEFAULT_M
     async setPreference(input, { applyNow = true, persist = true } = {}) {
       const parsed = parseModelPreference(input);
       preference = parsed;
+      oneShotPreference = null;
       if (persist && copiPaths) {
         await saveConfig(copiPaths, { modelPreference: formatModelPreference(parsed) }).catch(() => {});
       }
@@ -162,21 +183,32 @@ class CopiInteractiveMode extends InteractiveMode {
 
     if (live.ready && Array.isArray(live.models) && live.models.length > 0) {
       headerText = `Web models (live from Edge · preference: ${currentPref})`;
-      items = live.models.map(item => {
-        const alias = presetAliasForIndex(item.index, live.models.length);
-        const meta = [
-          alias ? `alias: ${alias}` : '',
-          item.selected ? 'current' : '',
-          item.description
-        ].filter(Boolean).join(' · ');
-        return {
-          value: String(item.index),
-          label: `[${item.index}] ${item.label}`,
-          description: meta || undefined
-        };
-      });
-      const currentIdx = live.models.findIndex(item => item.selected);
-      if (currentIdx >= 0) initialIndex = currentIdx;
+      items = [
+        {
+          value: 'smart',
+          label: '[smart] Quota-saver mode',
+          description: 'Think deeper on main prompt, quick on tool-result follow-ups'
+        },
+        ...live.models.map(item => {
+          const alias = presetAliasForIndex(item.index, live.models.length);
+          const meta = [
+            alias ? `alias: ${alias}` : '',
+            item.selected ? 'current' : '',
+            item.description
+          ].filter(Boolean).join(' · ');
+          return {
+            value: String(item.index),
+            label: `[${item.index}] ${item.label}`,
+            description: meta || undefined
+          };
+        })
+      ];
+      if (currentPref === 'smart') {
+        initialIndex = 0;
+      } else {
+        const currentIdx = live.models.findIndex(item => item.selected);
+        if (currentIdx >= 0) initialIndex = currentIdx + 1;
+      }
     } else {
       const reasonHint = live.reason === 'not_signed_in'
         ? 'Sign in to Microsoft 365 in Edge, then run /model again to see the live list.'
@@ -205,7 +237,7 @@ class CopiInteractiveMode extends InteractiveMode {
         this.ui.requestRender();
       };
       container.addChild(list);
-      container.addChild(new Text('\x1b[2mUse ↑/↓ + Enter to choose, Esc to cancel, or /model auto|quick|think|<index>\x1b[0m', 0, 0));
+      container.addChild(new Text('\x1b[2mUse ↑/↓ + Enter to choose, Esc to cancel, or /model smart|quick|auto|think|<index>\x1b[0m', 0, 0));
       return { component: container, focus: list };
     });
   }
@@ -308,6 +340,10 @@ export async function createRuntime({
   modelController,
   prewarmBrowser = false,
   autoApproveRisky = false,
+  readonly = false,
+  preloadWorkspace = true,
+  allowNonGitFallback,
+  allowPlainTextFinal,
   bellState,
   sharedBrowserOptions
 }) {
@@ -333,10 +369,21 @@ export async function createRuntime({
 
   modelController?.attachBrowser(activeBrowser);
 
-  const projectInstructions = await loadProjectInstructions(cwd);
+  const [projectInstructions, promptTemplates, workspaceSnapshot, initialQuota] = await Promise.all([
+    loadProjectInstructions(cwd),
+    loadPromptTemplates({ copiPaths, cwd, reservedNames: RESERVED_COMMANDS }),
+    preloadWorkspace && copiPaths ? collectWorkspaceSnapshot(cwd) : Promise.resolve(''),
+    readTodayQuota(copiPaths)
+  ]);
+
   const providerControl = {};
+  const readonlyState = { enabled: Boolean(readonly) };
+  const quotaState = { record: initialQuota };
   let sessionRef = null;
+  let unsubModel = null;
+
   const webUI = createWebUI(activeBrowser, {
+    cwd,
     copiPaths,
     sessionId,
     profile,
@@ -344,13 +391,17 @@ export async function createRuntime({
     modelController,
     providerControl,
     loadedInstructionFiles: projectInstructions.files,
+    promptTemplates,
     autoApproveRisky,
+    readonlyState,
     bellState,
+    quotaState,
     getSessionMessages: () => sessionRef?.messages ?? [],
     getLastAssistantText: () => sessionRef?.getLastAssistantText?.(),
-    getSessionMessageCount: () => sessionRef?.messages?.length ?? 0
+    getSessionMessageCount: () => sessionRef?.messages?.length ?? 0,
+    onShutdownCleanup: () => { unsubModel?.(); }
   });
-  const unsubModel = modelController?.onChange?.(() => webUI.requestFooterRender());
+  unsubModel = modelController?.onChange?.(() => webUI.requestFooterRender());
 
   try {
     const settingsManager = SettingsManager.inMemory({
@@ -369,15 +420,29 @@ export async function createRuntime({
       onStatus: webUI.onStatus,
       onActivity: (event, data) => logActivity(copiPaths, event, data),
       getIncompleteCheckpoints: id => readIncompleteCheckpoints(copiPaths, id),
+      getModelPreference: () => modelController?.getEffectiveDisplayPreference?.() ?? modelController?.getPreference?.() ?? DEFAULT_MODEL_PREFERENCE,
+      getQuotaState: () => readTodayQuota(copiPaths),
+      onWebTurn: async effectivePref => {
+        const updated = await recordWebTurn(copiPaths, effectivePref);
+        webUI.updateQuotaRecord(updated);
+      },
+      onThinkLimited: async () => {
+        const updated = await markThinkLimitedToday(copiPaths);
+        webUI.updateQuotaRecord(updated);
+      },
+      allowPlainTextFinal: allowPlainTextFinal ?? Boolean(copiPaths),
       control: providerControl
     }));
     const appendSystemPrompt = [
       'Use Bash syntax and forward-slash paths on Windows. ' +
       'Use grep and find to search project files; use bash for commands, builds and tests. ' +
-      'Keep tool output focused: read files with offset/limit and bound command output. Inspect large files in sections.'
+      'Minimize round-trips: batch independent find/grep/read calls together in one turn, read whole small/medium files (<300 lines) in one call, combine edits per file, and chain verification commands with &&.'
     ];
     if (projectInstructions.promptSection) {
       appendSystemPrompt.push(projectInstructions.promptSection);
+    }
+    if (workspaceSnapshot) {
+      appendSystemPrompt.push(workspaceSnapshot);
     }
     const services = await createAgentSessionServices({
       cwd, agentDir, settingsManager, modelRuntime,
@@ -387,10 +452,12 @@ export async function createRuntime({
         appendSystemPrompt
       }
     });
+    const enableFallback = allowNonGitFallback ?? Boolean(copiPaths);
     const created = await createAgentSessionFromServices({
       services, sessionManager, sessionStartEvent,
       model: modelRuntime.getModel('copilot-web', 'm365-web'), thinkingLevel: 'off',
-      tools: ['read', 'bash', 'edit', 'write', 'grep', 'find'], customTools: createSearchTools(cwd)
+      tools: readonly ? ['read', 'grep', 'find'] : ['read', 'bash', 'edit', 'write', 'grep', 'find'],
+      customTools: createSearchTools(cwd, { allowNonGitFallback: enableFallback })
     });
     sessionRef = created.session;
 
@@ -400,6 +467,7 @@ export async function createRuntime({
         sessionId,
         cwd,
         profile: profile ?? null,
+        readonly: Boolean(readonly),
         existingMessages: sessionRef.messages.length,
         instructions: projectInstructions.files
       });
@@ -439,6 +507,8 @@ export async function runAgent({
   profile,
   modelPreference,
   autoApproveRisky = false,
+  readonly = false,
+  preloadWorkspace = true,
   bell,
   prompt,
   interactive,
@@ -473,6 +543,8 @@ export async function runAgent({
       modelController,
       prewarmBrowser: Boolean(interactive),
       autoApproveRisky: effectiveAutoApprove,
+      readonly,
+      preloadWorkspace,
       bellState,
       sharedBrowserOptions
     });
@@ -484,8 +556,9 @@ export async function runAgent({
     });
 
     if (interactive) {
+      const initialPrompt = prompt ? (await expandFileMentions(prompt, runtime.cwd)).text : undefined;
       mode = new CopiInteractiveMode(runtime, {
-        initialMessage: prompt || undefined,
+        initialMessage: initialPrompt,
         modelController
       });
       await mode.run();
@@ -501,7 +574,8 @@ export async function runAgent({
       });
       process.on('SIGINT', interrupt);
       process.on('SIGTERM', interrupt);
-      await session.prompt(prompt);
+      const expandedPrompt = (await expandFileMentions(prompt, runtime.cwd)).text;
+      await session.prompt(expandedPrompt);
       const last = session.state.messages.findLast(message => message.role === 'assistant');
       if (process.exitCode !== 130 && (!last || last.stopReason !== 'stop')) {
         throw new Error(last?.errorMessage ?? 'The task did not complete.');

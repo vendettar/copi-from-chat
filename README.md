@@ -24,19 +24,28 @@ copi --help
 
 ```bash
 copi -C C:/path/to/project
-copi -C C:/path/to/project "inspect this project"
+copi -C C:/path/to/project "inspect @src/app.js and fix the crash"
 copi -C C:/path/to/project --model quick
-copi -p -C C:/path/to/project "run the tests"
+copi -C C:/path/to/project --readonly
+git diff | copi -p -C C:/path/to/project "review these changes"
+copi doctor
+copi host status
+copi host stop
+copi sessions --all
 ```
 
 Launching `copi` in interactive mode immediately opens the shared Edge window in the background so you can sign in to Microsoft 365 right away without waiting for your first message.
 
-### Model selection (`/model` and `--model`)
+### Quota-Saver Engine & Model Selection (`/model`, `/think`, `/quota`)
 
-Model selection uses pure positional indices instead of hardcoded model names, so it stays compatible across Chinese/English M365 menus (such as `自动 / 快速响应 / 深度思考` or `Auto / Quick response / Think deeper`) and future model renames, falling back gracefully to the active/Auto model without failing the turn.
+M365 Copilot enforces a strict daily cap on `深度思考 / Think deeper`, while `快速响应 / Quick response` and `自动 / Auto` have much larger allowances. `copi` maximizes work per daily quota automatically:
 
-- `/model`: reads the live model options from the open Edge tab and lets you choose interactively (or shows presets if Edge is still signing in).
-- `/model auto` / `/model quick` / `/model think` / `/model <index>` (or CLI `-m, --model <target>`): switches immediately when Edge is ready and saves your default preference under `~/.copi/config.json`.
+- **`smart` mode (default)**: uses `深度思考 / Think deeper` on your main prompt and automatically steps down to `快速响应 / Quick response` for mechanical tool-result follow-ups. If M365 reports a `Think deeper` daily limit, Copi marks it for today in `~/.copi/quota.json`, switches to `quick`, and continues cleanly without crashing.
+- **Zero-turn local pre-context**: new conversations locally preload a compact workspace snapshot (branch, `git status`, manifest, file tree) and expand `@path/to/file` / `@path/to/file:10-80` mentions (plus piped `stdin`), eliminating 2–4 exploratory web round-trips.
+- **Multi-tool batching & local syntax checks**: prompts instruct Copilot to batch independent reads/searches/edits and chain commands with `&&`; `write`/`edit` on `.js`/`.json` files automatically attach a zero-quota local syntax check right in the tool result.
+- **Zero-cost plain-text & trailing-comma recovery**: clean plain-text final answers are accepted locally without burning a `mode: 'repair'` quota turn.
+- **One-shot `/think <prompt>`**: even when using `/model quick` or `/model auto`, run `/think <question>` to use `Think deeper` for a single turn and automatically return to your previous preference.
+- **Index-based compatibility**: `/model` reads live options from Edge and matches by positional index (`smart`, `quick`, `auto`, `think`, or `0..N`), staying resilient across Chinese/English UI and future model renames.
 
 ## Resume conversations
 
@@ -69,11 +78,18 @@ The shared login state is stored under `~/.copi/shared-browser-profile`. `--prof
 
 ## Interactive commands
 
-- `/model [auto|quick|think|<index>]`: read live models from Edge or switch model preference (`Ctrl+L`)
+- `/model [smart|quick|auto|think|<index>]`: read live models from Edge or switch model preference (`Ctrl+L`)
+- `/think <prompt>`: run one prompt with `Think deeper`, then restore your previous preference
+- `/quota`: show today's web turn breakdown (`think` / `quick` / `auto`) and quota-saving status
+- `/undo [--yes]`: revert file changes made by Copi during the last agent turn
+- `/readonly [on|off]`: toggle read-only exploration mode (`read`, `grep`, `find` only)
 - `/inspect [N]`: open an interactive viewer for a specific tool call's full arguments and output
+- `/review` · `/commit` · `/fix`: built-in prompt workflows (plus custom `~/.copi/prompts/*.md` and `.copi/prompts/*.md`)
 - `/copy [code]`: copy the last assistant reply (or last fenced code block) to the clipboard
 - `/diff`: show `git status -s` and `git diff --stat` for the current workspace
-- `/status`: show session info, compaction threshold progress, loaded instructions, model, and Edge Browser Host status
+- `/status`: show session info, daily quota, compaction progress, loaded instructions, model, and Edge Browser Host status
+- `/doctor`: check Node, Git Bash, Edge, Browser Host, quota, and live M365 DOM selectors
+- `/export [file.md]`: export the current session transcript to a Markdown report
 - `/rename <name>`: set a display name for this saved session (shown in `/resume`)
 - `/reconnect`: open a fresh Edge tab and restore saved local JSONL history on the next turn
 - `/cleanup [days]`: prune old tool checkpoints and temporary saved tool outputs (default: 14 days)
@@ -96,7 +112,9 @@ The shared login state is stored under `~/.copi/shared-browser-profile`. `--prof
 - `sessions`: persisted Pi conversations
 - `shared-browser-profile`: login state for the shared Edge window
 - `browser-profiles`: optional isolated profiles used with `--profile`
-- `config.json`: saved user preferences (such as default web model preference)
+- `config.json`: saved user preferences (default model mode, bell, optional `hostIdleMinutes`)
+- `quota.json`: daily local web-turn counter by model tier (`think`/`quick`/`auto`)
+- `prompts`: optional user custom slash-command prompt templates (`*.md`)
 - `activity.jsonl`: lifecycle events
 - `checkpoints`: tool-execution checkpoints
 - `locks`: session, startup, and optional profile ownership locks
@@ -116,14 +134,14 @@ Create the portable npm package on the source computer:
 npm pack
 ```
 
-Copy the generated `copi-from-chat-0.0.9.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
+Copy the generated `copi-from-chat-0.1.0.tgz` to the other computer, then install or upgrade it with Node.js 20 or newer:
 
 ```bash
-npm install -g ./copi-from-chat-0.0.9.tgz
+npm install -g ./copi-from-chat-0.1.0.tgz
 copi --help
 ```
 
-Before installing or upgrading, exit all running `copi` processes. Windows may otherwise lock Pi's native terminal module and cause an `EBUSY` installation error.
+Before installing or upgrading, stop any running `copi` processes (`copi host stop` stops the shared Browser Host cleanly). Windows may otherwise lock Pi's native terminal module and cause an `EBUSY` installation error.
 
 ### Command-line dependencies
 

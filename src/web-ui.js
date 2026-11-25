@@ -3,13 +3,23 @@ import { readFile } from 'node:fs/promises';
 import { Container, SelectList, Spacer, Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { PROACTIVE_COMPACTION_THRESHOLD } from './compaction.js';
 import { cleanupLocalArtifacts, copyToClipboard, extractLastCodeBlock, getGitDiffSummary } from './commands.js';
+import { runDoctor } from './doctor.js';
+import { exportSessionToFile } from './export.js';
 import { formatModelPreference } from './model-preference.js';
+import { runPostEditSyntaxCheck } from './post-edit-check.js';
+import { expandFileMentions } from './precontext.js';
+import { renderPromptTemplate } from './prompts.js';
+import { formatQuotaShort, readTodayQuota } from './quota.js';
 import { assessToolRisk } from './safety.js';
 import { isLockedByOther, logActivity, recordToolCheckpoint, saveConfig } from './storage.js';
 import {
   createRoleMarkdownTransformer, createToolHistoryStore, formatDuration,
   summarizeToolCall, wrapCompactToolRenderer
 } from './tool-ui.js';
+import { createUndoManager } from './undo.js';
+
+const ALL_TOOLS = ['read', 'bash', 'edit', 'write', 'grep', 'find'];
+const READONLY_TOOLS = ['read', 'grep', 'find'];
 
 const SELECT_THEME = {
   selectedPrefix: text => `\x1b[36m${text}\x1b[0m`,
@@ -92,8 +102,9 @@ function createDetailViewerComponent(entry, { onBack, onClose, onCopy }) {
   };
 }
 
-// Terminal integration, role distinction, compact tool rendering, safety guards, and slash commands.
+// Terminal integration, role distinction, compact tool rendering, safety guards, quota telemetry, and slash commands.
 export function createWebUI(browser, {
+  cwd = process.cwd(),
   copiPaths,
   sessionId,
   profile,
@@ -101,17 +112,22 @@ export function createWebUI(browser, {
   modelController,
   providerControl,
   loadedInstructionFiles = [],
+  promptTemplates = [],
   autoApproveRisky = false,
+  readonlyState = { enabled: false },
   bellState = { enabled: true, minMs: 5000 },
+  quotaState = { record: null },
   getSessionMessages = () => [],
   getLastAssistantText = () => undefined,
-  getSessionMessageCount = () => getSessionMessages().length
+  getSessionMessageCount = () => getSessionMessages().length,
+  onShutdownCleanup = () => {}
 } = {}) {
   let ui, workingMessage, footerTui;
   let edgeState = browser?.mode === 'shared' ? 'connecting' : 'idle';
   let turnStartedAt = 0;
   const toolStartTimes = new Map();
   const toolHistory = createToolHistoryStore();
+  const undoManager = createUndoManager(cwd);
 
   const requestFooterRender = () => {
     try { footerTui?.requestRender(); } catch { /* ignore */ }
@@ -123,10 +139,15 @@ export function createWebUI(browser, {
     requestFooterRender();
   };
 
+  const updateQuotaRecord = record => {
+    quotaState.record = record;
+    requestFooterRender();
+  };
+
   const onStatus = message => {
     if (typeof message === 'string') {
       if (/sign in to microsoft 365/i.test(message)) setEdgeState('sign-in required');
-      else if (/sending to copilot|receiving copilot|waiting for copilot/i.test(message)) setEdgeState('ready');
+      else if (/sending to copilot|receiving copilot|waiting for copilot|thinking deeply/i.test(message)) setEdgeState('ready');
     }
     if (!ui || message === workingMessage) return;
     workingMessage = message;
@@ -193,12 +214,14 @@ export function createWebUI(browser, {
   return {
     onStatus,
     setEdgeState,
+    updateQuotaRecord,
     requestFooterRender,
     toolHistory,
+    undoManager,
     extension(pi) {
       if (typeof pi.registerMarkdownTransformer === 'function') {
         pi.registerMarkdownTransformer(createRoleMarkdownTransformer({
-          getModelTag: () => modelController?.getPreference() ?? 'think'
+          getModelTag: () => modelController?.getEffectiveDisplayPreference?.() ?? modelController?.getPreference?.() ?? 'smart'
         }));
       }
 
@@ -209,14 +232,13 @@ export function createWebUI(browser, {
         if (ctx.mode !== 'tui') return;
         ui = ctx.ui;
         workingMessage = undefined;
-        // Single ASCII frame disables Pi's 80 ms spinner timer and preserves Git Bash scrollback.
         ui.setWorkingIndicator({ frames: ['*'] });
         ui.setTitle(`Copi - ${basename(ctx.cwd)}`);
         ui.setHeader((_tui, theme) => ({
           invalidate() {},
           render: width => [
             theme.fg('accent', 'Copi · Copilot from Chat'),
-            theme.fg('dim', 'Enter send · Esc stop · Ctrl+O details · /model · /inspect · /diff · /copy · /resume · /new · /quit')
+            theme.fg('dim', 'Enter send · Esc stop · Ctrl+O details · /model · /think · /quota · /undo · /inspect · /resume · /quit')
           ].map(line => truncateToWidth(line, width))
         }));
         ui.setFooter((tui, theme, data) => {
@@ -230,12 +252,15 @@ export function createWebUI(browser, {
             invalidate() {},
             render: width => {
               const branch = data.getGitBranch() ? ` (${data.getGitBranch()})` : '';
-              const modelTag = modelController ? formatModelPreference(modelController.getPreference()) : 'think';
+              const modelTag = modelController ? formatModelPreference(modelController.getPreference()) : 'smart';
+              const quotaText = quotaState.record ? formatQuotaShort(quotaState.record) : '';
               const shortSid = sessionId ? sessionId.slice(0, 8) : '';
               const parts = [
                 `${ctx.cwd}${branch}`,
+                ...(readonlyState.enabled ? ['[RO]'] : []),
                 `model: ${modelTag}`,
                 `Edge: ${edgeState}`,
+                ...(quotaText ? [quotaText] : []),
                 ...(shortSid ? [`session: ${shortSid}`] : []),
                 'Ctrl+O details'
               ];
@@ -243,6 +268,15 @@ export function createWebUI(browser, {
             }
           };
         });
+      });
+
+      // Expand @path/to/file mentions locally (0 extra web turns!).
+      pi.on('input', async (event, ctx) => {
+        if (!event?.text || !event.text.includes('@')) return { action: 'continue' };
+        const expanded = await expandFileMentions(event.text, ctx.cwd);
+        if (!expanded.loadedFiles.length) return { action: 'continue' };
+        ctx.ui?.notify(`Preloaded @file context: ${expanded.loadedFiles.join(', ')}`, 'info');
+        return { action: 'transform', text: expanded.text };
       });
 
       pi.on('session_before_switch', async (event, ctx) => {
@@ -257,26 +291,54 @@ export function createWebUI(browser, {
       });
 
       pi.on('tool_call', async (event, ctx) => {
-        if (autoApproveRisky) return;
-        const risk = assessToolRisk({ toolName: event.toolName, input: event.input, cwd: ctx.cwd });
-        if (!risk.risky) return;
-        if (ctx.hasUI) {
-          const allowed = await ctx.ui.confirm(risk.title, risk.detail);
-          if (!allowed) {
-            void logActivity(copiPaths, 'tool_blocked', { sessionId, toolName: event.toolName, reason: risk.reason });
-            return { block: true, reason: `Blocked by user confirmation: ${risk.reason}` };
-          }
-          return;
+        if (readonlyState.enabled && ['write', 'edit', 'bash'].includes(event.toolName)) {
+          return {
+            block: true,
+            reason: `Blocked "${event.toolName}" because read-only mode is active. Use /readonly off to allow edits or shell commands.`
+          };
         }
-        void logActivity(copiPaths, 'tool_blocked', { sessionId, toolName: event.toolName, reason: risk.reason, mode: ctx.mode });
+
+        if (!autoApproveRisky) {
+          const risk = assessToolRisk({ toolName: event.toolName, input: event.input, cwd: ctx.cwd });
+          if (risk.risky) {
+            if (ctx.hasUI) {
+              const allowed = await ctx.ui.confirm(risk.title, risk.detail);
+              if (!allowed) {
+                void logActivity(copiPaths, 'tool_blocked', { sessionId, toolName: event.toolName, reason: risk.reason });
+                return { block: true, reason: `Blocked by user confirmation: ${risk.reason}` };
+              }
+            } else {
+              void logActivity(copiPaths, 'tool_blocked', { sessionId, toolName: event.toolName, reason: risk.reason, mode: ctx.mode });
+              return {
+                block: true,
+                reason: `Blocked risky operation in non-interactive mode (${risk.reason}). Pass --yes if you want to allow it.`
+              };
+            }
+          }
+        }
+
+        // Capture pre-edit file snapshot for /undo right before write/edit runs.
+        if ((event.toolName === 'write' || event.toolName === 'edit') && typeof event.input?.path === 'string') {
+          await undoManager.captureBeforeModify(event.input.path);
+        }
+      });
+
+      // Zero-cost local JS/JSON syntax check right after write/edit (saves extra bash verification turns!).
+      pi.on('tool_result', async (event, ctx) => {
+        if (event.isError || !['write', 'edit'].includes(event.toolName)) return;
+        const targetPath = event.input?.path;
+        if (typeof targetPath !== 'string') return;
+        const check = await runPostEditSyntaxCheck(targetPath, ctx.cwd);
+        if (!check) return;
+        const existing = Array.isArray(event.content) ? event.content : [];
         return {
-          block: true,
-          reason: `Blocked risky operation in non-interactive mode (${risk.reason}). Pass --yes if you want to allow it.`
+          content: [...existing, { type: 'text', text: `\n${check.note}` }]
         };
       });
 
       pi.on('agent_start', () => {
         turnStartedAt = Date.now();
+        undoManager.beginTurn();
         onStatus('Waiting for Copilot...');
       });
 
@@ -336,6 +398,8 @@ export function createWebUI(browser, {
 
       pi.on('agent_end', () => {
         onStatus();
+        undoManager.commitTurn();
+        modelController?.clearOneShotPreference?.();
         const elapsed = turnStartedAt ? Date.now() - turnStartedAt : 0;
         turnStartedAt = 0;
         if (ui && bellState?.enabled && elapsed >= (bellState.minMs ?? 5000) && process.stdout.isTTY) {
@@ -348,6 +412,7 @@ export function createWebUI(browser, {
         footerTui = undefined;
         workingMessage = undefined;
         toolStartTimes.clear();
+        onShutdownCleanup();
         const empty = getSessionMessageCount() === 0;
         if (copiPaths && sessionId) {
           await logActivity(copiPaths, 'session_end', { sessionId, reason: event?.reason ?? 'shutdown', empty });
@@ -366,6 +431,118 @@ export function createWebUI(browser, {
       pi.on('session_before_compact', (_event, ctx) => {
         ctx.ui.notify('Manual Pi compaction is disabled; Copi compacts older turns automatically on resume after 12 messages.', 'info');
         return { cancel: true };
+      });
+
+      pi.registerCommand('think', {
+        description: 'Run ONE prompt with Think deeper, then restore your previous model preference',
+        handler: async (args, ctx) => {
+          const prompt = (args ?? '').trim();
+          if (!prompt) {
+            ctx.ui.notify('Usage: /think <your question or task>', 'info');
+            return;
+          }
+          modelController?.setOneShotPreference?.({ kind: 'preset', name: 'think' });
+          ctx.ui.notify('Using Think deeper for this turn only...', 'info');
+          const expanded = await expandFileMentions(prompt, ctx.cwd);
+          pi.sendUserMessage(expanded.text);
+        }
+      });
+
+      pi.registerCommand('quota', {
+        description: 'Show today\'s web turn count by model tier and quota-saving tips',
+        handler: async (_args, ctx) => {
+          const record = await readTodayQuota(copiPaths);
+          updateQuotaRecord(record);
+          const pref = modelController ? formatModelPreference(modelController.getPreference()) : 'smart';
+          ctx.ui.notify([
+            `Daily Copilot web turns (${record.date}): ${record.counts.total}`,
+            `  think: ${record.counts.think}${record.thinkLimited ? ' (daily cap detected today — auto-using quick)' : ''}`,
+            `  quick: ${record.counts.quick}`,
+            `  auto:  ${record.counts.auto}`,
+            ...(record.counts.index ? [`  index: ${record.counts.index}`] : []),
+            `Current model preference: ${pref}`,
+            'Quota tips: use /model smart (or /model quick + /think <prompt>), reference files with @path/to/file, and use /diff /undo /inspect locally (0 quota).'
+          ].join('\n'), 'info');
+        }
+      });
+
+      pi.registerCommand('undo', {
+        description: 'Revert file edits made by Copi during the last agent turn',
+        handler: async (args, ctx) => {
+          const pending = undoManager.peekLastTurn();
+          if (!pending) {
+            ctx.ui.notify('No agent file edits recorded to undo in this session.', 'info');
+            return;
+          }
+          const summary = pending.files.map(f => `  - ${f.action}: ${f.relPath}`).join('\n');
+          const skipConfirm = /(?:^|\s)(?:--yes|-y)(?:\s|$)/.test(args ?? '');
+          if (!skipConfirm && ctx.hasUI) {
+            const ok = await ctx.ui.confirm(
+              `Undo agent turn #${pending.turnNumber}?`,
+              `This will revert the following file changes:\n\n${summary}\n\nProceed?`
+            );
+            if (!ok) {
+              ctx.ui.notify('Undo cancelled.', 'info');
+              return;
+            }
+          }
+          const result = await undoManager.undoLastTurn();
+          if (!result.undone) {
+            ctx.ui.notify('Nothing to undo.', 'info');
+            return;
+          }
+          ctx.ui.notify([
+            `Reverted ${result.files.length} file(s) from turn #${result.turnNumber}:`,
+            ...result.files.map(f => `  - ${f.action}: ${f.relPath}`)
+          ].join('\n'), 'info');
+        }
+      });
+
+      pi.registerCommand('readonly', {
+        description: 'Toggle read-only exploration mode (disables write, edit, bash)',
+        handler: async (args, ctx) => {
+          const raw = (args ?? '').trim().toLowerCase();
+          if (raw === 'on' || raw === '1' || raw === 'true') readonlyState.enabled = true;
+          else if (raw === 'off' || raw === '0' || raw === 'false') readonlyState.enabled = false;
+          else if (!raw) readonlyState.enabled = !readonlyState.enabled;
+          else {
+            ctx.ui.notify('Usage: /readonly [on|off]', 'warning');
+            return;
+          }
+          if (typeof pi.setActiveTools === 'function') {
+            pi.setActiveTools(readonlyState.enabled ? READONLY_TOOLS : ALL_TOOLS);
+          }
+          requestFooterRender();
+          ctx.ui.notify(`Read-only mode: ${readonlyState.enabled ? 'ON (tools: read, grep, find)' : 'OFF (all tools enabled)'}.`, 'info');
+        }
+      });
+
+      pi.registerCommand('doctor', {
+        description: 'Run environment, Browser Host, quota, and M365 DOM selector diagnostics',
+        handler: async (_args, ctx) => {
+          const report = await runDoctor({ paths: copiPaths, browser });
+          ctx.ui.notify(report.text, report.ok ? 'info' : 'warning');
+        }
+      });
+
+      pi.registerCommand('export', {
+        description: 'Export the current conversation to a Markdown report (usage: /export [file.md])',
+        handler: async (args, ctx) => {
+          const messages = getSessionMessages();
+          if (!messages.length) {
+            ctx.ui.notify('No messages to export yet.', 'warning');
+            return;
+          }
+          const sessionName = typeof pi.getSessionName === 'function' ? pi.getSessionName() : undefined;
+          const res = await exportSessionToFile({
+            cwd: ctx.cwd,
+            sessionId,
+            sessionName,
+            messages,
+            outputPath: args
+          });
+          ctx.ui.notify(`Exported session (${(res.bytes / 1024).toFixed(1)} KB) to ${res.path.replaceAll('\\', '/')}`, 'info');
+        }
       });
 
       pi.registerCommand('inspect', {
@@ -428,17 +605,19 @@ export function createWebUI(browser, {
       });
 
       pi.registerCommand('status', {
-        description: 'Show session, context compaction, model, and Edge Browser Host status',
+        description: 'Show session, quota, compaction, model, and Edge Browser Host status',
         handler: async (_args, ctx) => {
           const messageCount = getSessionMessageCount();
-          const liveStatus = typeof browser?.getStatus === 'function'
-            ? await browser.getStatus().catch(() => null)
-            : null;
+          const [liveStatus, quota] = await Promise.all([
+            typeof browser?.getStatus === 'function' ? browser.getStatus().catch(() => null) : null,
+            readTodayQuota(copiPaths)
+          ]);
+          updateQuotaRecord(quota);
           if (liveStatus?.state) {
             setEdgeState(liveStatus.state === 'waiting_signin' ? 'sign-in required' : liveStatus.state);
           }
           const sessionName = typeof pi.getSessionName === 'function' ? pi.getSessionName() : undefined;
-          const modelPref = modelController ? formatModelPreference(modelController.getPreference()) : 'think';
+          const modelPref = modelController ? formatModelPreference(modelController.getPreference()) : 'smart';
           const activeModel = liveStatus?.activeModel ?? modelController?.getLastSelectedLabel?.() ?? null;
           const pState = providerControl?.getState?.();
           const compactionNote = messageCount > PROACTIVE_COMPACTION_THRESHOLD
@@ -448,10 +627,13 @@ export function createWebUI(browser, {
           ctx.ui.notify([
             `Workspace: ${ctx.cwd}`,
             `Session: ${sessionId ?? '(in-memory)'}${sessionName ? ` ("${sessionName}")` : ''}`,
-            `Context: ${compactionNote}`,
+            `Context: ${compactionNote}${pState?.webTurnsInTab ? ` · web turns in tab: ${pState.webTurnsInTab}` : ''}`,
+            `Quota: ${formatQuotaShort(quota)} (${quota.date})`,
             `Model: ${modelPref}${activeModel ? ` (active: ${activeModel})` : ''}`,
             `Edge: ${liveStatus?.state ?? edgeState}${hostDetail}${pState?.needsNewChat ? ' · web needs /reconnect or /new' : ''}`,
+            `Mode: ${readonlyState.enabled ? 'read-only (read, grep, find)' : 'read-write'} · undo turns: ${undoManager.turnCount()}`,
             `Instructions: ${loadedInstructionFiles.length ? loadedInstructionFiles.join(', ') : '(none)'}`,
+            `Prompts: ${promptTemplates.length ? promptTemplates.map(p => `/${p.name}`).join(', ') : '(none)'}`,
             `Tools recorded: ${toolHistory.list().length} (Ctrl+O to expand, /inspect to view one)`,
             `Safety guard: ${autoApproveRisky ? 'auto-approved (--yes)' : 'confirm risky commands & outside writes'}`,
             `Completion bell: ${bellState?.enabled ? 'on' : 'off'} (/bell on|off)`
@@ -551,10 +733,22 @@ export function createWebUI(browser, {
             `Browser: ${browserMode} (${edgeState})`,
             ...(modelLine ? [modelLine] : []),
             ...(loadedInstructionFiles.length ? [`Instructions: ${loadedInstructionFiles.join(', ')}`] : []),
-            'Tools: read, bash, edit, write, grep, find'
+            `Tools: ${(readonlyState.enabled ? READONLY_TOOLS : ALL_TOOLS).join(', ')}`
           ].join('\n'), 'info');
         }
       });
+
+      // Register built-in and user custom prompt templates (/review, /commit, /fix, ~/.copi/prompts/*.md).
+      for (const template of promptTemplates) {
+        pi.registerCommand(template.name, {
+          description: `[${template.source}] ${template.description}`,
+          handler: async (args, ctx) => {
+            const rendered = await renderPromptTemplate(template, { args: args ?? '', cwd: ctx.cwd });
+            const expanded = await expandFileMentions(rendered, ctx.cwd);
+            pi.sendUserMessage(expanded.text);
+          }
+        });
+      }
     }
   };
 }

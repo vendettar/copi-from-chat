@@ -5,7 +5,7 @@ import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CopilotTab, launchPersistentEdge, waitForChatReady } from './browser.js';
 import { getCopiPaths } from './paths.js';
-import { logActivity } from './storage.js';
+import { logActivity, readConfig } from './storage.js';
 
 const MAX_IDLE_TABS = 16;
 const HEARTBEAT_MS = 15000;
@@ -56,7 +56,8 @@ export async function startBrowserHost({
   channel = process.platform === 'win32' ? 'msedge' : 'chrome',
   headless = false,
   context: injectedContext = null,
-  version = '0.0.9',
+  version = '0.1.0',
+  idleTimeoutMinutes,
   sendConfirmTimeoutMs,
   sendConfirmPollMs,
   composerTimeoutMs,
@@ -197,11 +198,19 @@ export async function startBrowserHost({
         return;
       }
 
-      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach|warm|models|model|reset|status)$/.exec(pathname);
+      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach|warm|models|model|reset|status|dom-health)$/.exec(pathname);
       if (!match) return sendJson(res, 404, { error: 'Not found' });
 
       const sessionId = decodeURIComponent(match[1]);
       const action = match[2];
+
+      if (req.method === 'GET' && action === 'dom-health') {
+        const entry = sessions.get(sessionId);
+        const health = entry
+          ? await entry.tab.inspectDomHealth()
+          : { pageOpen: false, composerCount: 0, sendButtonVisible: false, pickerFound: false, replyCount: 0 };
+        return sendJson(res, 200, health);
+      }
 
       if (req.method === 'GET' && action === 'status') {
         const entry = sessions.get(sessionId);
@@ -367,6 +376,7 @@ export async function startBrowserHost({
             fresh: Boolean(body.fresh),
             requireContinuation: Boolean(body.requireContinuation),
             ...(body.modelPreference !== undefined ? { modelPreference: body.modelPreference } : {}),
+            ...(body.turnContext !== undefined ? { turnContext: body.turnContext } : {}),
             onStatus: message => writeEvent({ type: 'status', message }),
             onSnapshot: snapshot => writeEvent({ type: 'snapshot', snapshot }),
             onEvent: detail => {
@@ -420,9 +430,30 @@ export async function startBrowserHost({
   await writeFileAtomic(paths.browserHostFile, JSON.stringify(descriptor, null, 2));
   await logActivity(paths, 'browser_host_start', { port, profileDir });
 
+  // Optional idle auto-shutdown when configured via ~/.copi/config.json (hostIdleMinutes).
+  const cfg = await readConfig(paths).catch(() => ({}));
+  const configuredIdleMin = idleTimeoutMinutes ?? (Number(cfg.hostIdleMinutes) > 0 ? Number(cfg.hostIdleMinutes) : 0);
+  let idleCheckTimer = null;
+  let lastActivityMs = Date.now();
+  if (configuredIdleMin > 0) {
+    const idleMs = configuredIdleMin * 60 * 1000;
+    idleCheckTimer = setInterval(() => {
+      const anyActive = [...sessions.values()].some(e => e.attachedCount > 0 || e.tab.busy);
+      if (anyActive) {
+        lastActivityMs = Date.now();
+        return;
+      }
+      if (Date.now() - lastActivityMs >= idleMs) {
+        void shutdown('idle_timeout');
+      }
+    }, Math.min(30000, Math.max(1000, Math.floor(idleMs / 2))));
+    idleCheckTimer.unref();
+  }
+
   async function shutdown(reason = 'shutdown') {
     if (closed) return;
     closed = true;
+    if (idleCheckTimer) clearInterval(idleCheckTimer);
     for (const entry of sessions.values()) {
       entry.activeAbort?.abort();
     }

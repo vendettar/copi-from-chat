@@ -5,13 +5,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DEFAULT_MODEL_PREFERENCE, formatModelPreference, getBuiltinModelPresets,
-  parseModelPreference, presetAliasForIndex, resolveCandidateIndices
+  parseModelPreference, presetAliasForIndex, resolveCandidateIndices, resolveEffectivePreference
 } from '../src/model-preference.js';
 import { ensureCopiDirs, getCopiPaths } from '../src/paths.js';
 import { readConfig, saveConfig } from '../src/storage.js';
 
-test('parseModelPreference accepts presets, Chinese aliases, and 0-based numeric indices', () => {
+test('parseModelPreference accepts smart/presets, Chinese aliases, and 0-based numeric indices', () => {
   assert.deepEqual(parseModelPreference(), DEFAULT_MODEL_PREFERENCE);
+  assert.deepEqual(parseModelPreference('smart'), { kind: 'preset', name: 'smart' });
+  assert.deepEqual(parseModelPreference('省额度'), { kind: 'preset', name: 'smart' });
   assert.deepEqual(parseModelPreference('auto'), { kind: 'preset', name: 'auto' });
   assert.deepEqual(parseModelPreference('自动'), { kind: 'preset', name: 'auto' });
   assert.deepEqual(parseModelPreference('quick'), { kind: 'preset', name: 'quick' });
@@ -24,18 +26,24 @@ test('parseModelPreference accepts presets, Chinese aliases, and 0-based numeric
   assert.throws(() => parseModelPreference(-1), /Invalid model index/);
   assert.equal(formatModelPreference({ kind: 'preset', name: 'quick' }), 'quick');
   assert.equal(formatModelPreference({ kind: 'index', index: 3 }), '3');
-  assert.equal(getBuiltinModelPresets().length, 3);
+  assert.equal(getBuiltinModelPresets().length, 4);
 });
 
-test('resolveCandidateIndices produces safe positional fallback orders for every preference', () => {
+test('resolveCandidateIndices and smart tiering produce safe positional fallback orders', () => {
+  // Smart tiering: main prompt -> think (index 2), tool-result follow-up -> quick (index 1), thinkLimited -> quick (index 1).
+  assert.deepEqual(resolveEffectivePreference('smart', { isToolResultTurn: false, thinkLimited: false }), { kind: 'preset', name: 'think' });
+  assert.deepEqual(resolveEffectivePreference('smart', { isToolResultTurn: true, thinkLimited: false }), { kind: 'preset', name: 'quick' });
+  assert.deepEqual(resolveEffectivePreference('smart', { isToolResultTurn: false, thinkLimited: true }), { kind: 'preset', name: 'quick' });
+  assert.deepEqual(resolveEffectivePreference('think', { thinkLimited: true }), { kind: 'preset', name: 'quick' });
+
   // 3-item menu: [0: Auto, 1: Quick, 2: Think]
+  assert.deepEqual(resolveCandidateIndices(3, 'smart', { isToolResultTurn: false }), [2, 1, 0]);
+  assert.deepEqual(resolveCandidateIndices(3, 'smart', { isToolResultTurn: true }), [1, 0, 2]);
   assert.deepEqual(resolveCandidateIndices(3, 'think'), [2, 1, 0]);
   assert.deepEqual(resolveCandidateIndices(3, 'quick'), [1, 0, 2]);
   assert.deepEqual(resolveCandidateIndices(3, 'auto'), [0, 1, 2]);
   assert.deepEqual(resolveCandidateIndices(3, 1), [1, 2, 0]);
-  // Out-of-range index falls back gracefully without erroring
   assert.deepEqual(resolveCandidateIndices(3, 9), [2, 1, 0]);
-  // 2-item and 1-item menus stay within bounds
   assert.deepEqual(resolveCandidateIndices(2, 'quick'), [0, 1]);
   assert.deepEqual(resolveCandidateIndices(2, 'think'), [1, 0]);
   assert.deepEqual(resolveCandidateIndices(1, 'think'), [0]);

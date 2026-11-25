@@ -354,28 +354,41 @@ test('persisted sessions save JSONL under ~/.copi/sessions, resume with proactiv
   assert.equal(runtime2.session.sessionFile, secondSessionFile);
 });
 
-test('copi CLI --help and --version print standalone metadata', async () => {
+test('copi CLI --help, --version, doctor, host status, and sessions subcommands work', async () => {
   const exec = promisify(execFile);
   const { stdout: helpOut } = await exec(process.execPath, ['src/agent.js', '--help']);
-  assert.match(helpOut, /Usage: copi \[options\] \[prompt\]/);
+  assert.match(helpOut, /Usage:/);
+  assert.match(helpOut, /copi doctor/);
+  assert.match(helpOut, /copi host <status\|stop>/);
+  assert.match(helpOut, /copi sessions/);
   assert.match(helpOut, /--continue/);
   assert.match(helpOut, /--session <id>/);
   assert.match(helpOut, /--model <target>/);
+  assert.match(helpOut, /--readonly/);
   assert.match(helpOut, /--yes/);
   assert.match(helpOut, /--no-bell/);
   assert.match(helpOut, /--profile <name>/);
-  assert.match(helpOut, /\/model/);
-  assert.match(helpOut, /\/inspect/);
-  assert.match(helpOut, /\/copy/);
-  assert.match(helpOut, /\/diff/);
-  assert.match(helpOut, /\/status/);
-  assert.match(helpOut, /\/rename/);
-  assert.match(helpOut, /\/reconnect/);
-  assert.match(helpOut, /\/cleanup/);
-  assert.match(helpOut, /\/resume/);
+  assert.match(helpOut, /\/think/);
+  assert.match(helpOut, /\/quota/);
+  assert.match(helpOut, /\/undo/);
+  assert.match(helpOut, /\/export/);
 
   const { stdout: versionOut } = await exec(process.execPath, ['src/agent.js', '--version']);
-  assert.equal(versionOut.trim(), '0.0.9');
+  assert.equal(versionOut.trim(), '0.1.0');
+
+  const tmpHome = await mkdtemp(join(tmpdir(), 'copi-cli-subcmd-'));
+  try {
+    const env = { ...process.env, COPI_HOME: tmpHome };
+    const { stdout: hostOut } = await exec(process.execPath, ['src/agent.js', 'host', 'status'], { env });
+    assert.match(hostOut, /Browser Host is not running/);
+    const { stdout: docOut } = await exec(process.execPath, ['src/agent.js', 'doctor'], { env });
+    assert.match(docOut, /\[PASS\] Node\.js/);
+    assert.match(docOut, /Daily turns/);
+    const { stdout: sessOut } = await exec(process.execPath, ['src/agent.js', 'sessions'], { env });
+    assert.match(sessOut, /No saved sessions found/);
+  } finally {
+    await rm(tmpHome, { recursive: true, force: true });
+  }
 });
 
 test('interactive startup pre-warms Edge and modelController persists and applies preferences', async t => {
