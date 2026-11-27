@@ -151,6 +151,25 @@ test('parseReply recovers trailing commas and allows clean plain-text final answ
   const rawNewlineJson = '<<<COPILOT_REPLY_START:r6>>>\n{"requestId":"r6","type":"final","text":"line 1\nline 2"}\n<<<COPILOT_REPLY_END:r6>>>';
   const recoveredNewline = parseReply({ completed: true, text: rawNewlineJson, codeBlocks: [] }, 'r6', []);
   assert.equal(recoveredNewline.text, 'line 1\nline 2');
+
+  // Malformed read-only type="final" with Chinese bracket `"lines":【错误1】...` or unescaped quotes recovers at 0 quota!
+  const chineseBracketFinal = '{"requestId":"r7","type":"final","lines":【错误1】PaApplication 报错","第二行：根因说明"]}';
+  const recoveredBracket = parseReply({ completed: true, text: chineseBracketFinal, codeBlocks: [chineseBracketFinal] }, 'r7', [], { allowPlainTextFinal: true });
+  assert.equal(recoveredBracket.type, 'final');
+  assert.equal(recoveredBracket.recoveredMalformedFinal, true);
+  assert.equal(recoveredBracket.text, '【错误1】PaApplication 报错\n第二行：根因说明');
+
+  const unescapedQuoteFinal = '{"requestId":"r8","type":"final","lines":["字段 "status" 异常","请检查 UserAuthenFilter"]}';
+  const recoveredUnescaped = parseReply({ completed: true, text: unescapedQuoteFinal, codeBlocks: [unescapedQuoteFinal] }, 'r8', [], { allowPlainTextFinal: true });
+  assert.equal(recoveredUnescaped.type, 'final');
+  assert.equal(recoveredUnescaped.text, '字段 "status" 异常\n请检查 UserAuthenFilter');
+
+  // Malformed tool_calls must NEVER be recovered by malformed-final fallback!
+  const brokenTool = '{"requestId":"r9","type":"tool_calls","calls":【broken}';
+  assert.throws(
+    () => parseReply({ completed: true, text: brokenTool, codeBlocks: [brokenTool] }, 'r9', [{ name: 'bash' }], { allowPlainTextFinal: true }),
+    { code: 'COPILOT_REPLY_FORMAT' }
+  );
 });
 
 test('zero-turn workspace snapshot, @file preloading, and local post-edit syntax check work with zero web quota', async t => {

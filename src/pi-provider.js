@@ -289,6 +289,52 @@ function escapeControlCharsInStrings(raw) {
   return out;
 }
 
+function unescapeRecoveredText(text) {
+  return text
+    .replace(/\\"/g, '"')
+    .replace(/\\t/g, '\t')
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\\\/g, '\\');
+}
+
+// Last-resort 0-quota recovery for READ-ONLY type="final" replies whose JSON syntax was slightly
+// mangled by the model (e.g. `"lines":【错误1】...` missing `["`, or an unescaped quote inside prose).
+// NEVER runs for tool_calls — zero local execution risk, prevents burning repair quota and losing the answer.
+function recoverMalformedFinalReply(raw, requestId) {
+  if (typeof raw !== 'string' || !raw.includes(requestId)) return null;
+  const escapedId = requestId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!new RegExp(`"requestId"\\s*:\\s*"${escapedId}"`).test(raw)) return null;
+  if (!/"type"\s*:\s*"final"/.test(raw)) return null;
+  if (/"type"\s*:\s*"tool_calls"|"calls"\s*:/.test(raw)) return null;
+
+  const fieldMatch = /"(lines|text)"\s*:\s*/.exec(raw);
+  if (!fieldMatch) return null;
+  let valueSlice = raw.slice(fieldMatch.index + fieldMatch[0].length).trim();
+  // Strip trailing closing object brace(s).
+  valueSlice = valueSlice.replace(/\}[\s`]*$/, '').trim();
+  if (!valueSlice) return null;
+
+  if (fieldMatch[1] === 'lines') {
+    if (valueSlice.startsWith('[')) valueSlice = valueSlice.slice(1).trim();
+    if (valueSlice.endsWith(']')) valueSlice = valueSlice.slice(0, -1).trim();
+    if (!valueSlice) return null;
+    // Strip outer quotes if array items were quoted strings, and split item boundaries cleanly.
+    const looksQuoted = valueSlice.startsWith('"') && valueSlice.endsWith('"');
+    const hasArraySeparators = /"\s*,\s*"/.test(valueSlice);
+    const items = (looksQuoted || hasArraySeparators)
+      ? valueSlice.replace(/^"/, '').replace(/"$/, '').split(/"\s*,\s*"/).map(unescapeRecoveredText)
+      : [unescapeRecoveredText(valueSlice.replace(/^"|"$/g, ''))];
+    const joined = items.join('\n').trim();
+    return joined ? { requestId, type: 'final', text: joined, recoveredMalformedFinal: true } : null;
+  }
+
+  // "text": ...
+  const unwrapped = valueSlice.replace(/^"|"$/g, '');
+  const text = unescapeRecoveredText(unwrapped).trim();
+  return text ? { requestId, type: 'final', text, recoveredMalformedFinal: true } : null;
+}
+
 function tryParseJsonRelaxed(raw) {
   try {
     return { ok: true, value: JSON.parse(raw), relaxed: false };
@@ -346,7 +392,7 @@ export function parseReply(reply, requestId, tools, { allowPlainTextFinal = fals
   }
   const sources = reply.codeBlocks?.length ? reply.codeBlocks : [body];
   const packets = new Map();
-  let syntax = '', seenOtherRequest = false, malformedCurrent = false;
+  let syntax = '', seenOtherRequest = false, malformedCurrent = false, malformedFinalCandidate = null;
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   for (const source of sources) {
     for (const raw of jsonContainers(source)) {
@@ -359,6 +405,9 @@ export function parseReply(reply, requestId, tools, { allowPlainTextFinal = fals
         const errSummary = String(error.message ?? '').replace(/\s+/g, ' ').slice(0, 140);
         syntax = `candidate length=${raw.length}, error="${errSummary}", offset=${offset ?? 'unknown'}, code points=${points}`;
         malformedCurrent ||= raw.includes(requestId);
+        if (allowPlainTextFinal && !malformedFinalCandidate) {
+          malformedFinalCandidate = recoverMalformedFinalReply(raw, requestId);
+        }
         continue;
       }
       const value = parsed.value;
@@ -370,6 +419,9 @@ export function parseReply(reply, requestId, tools, { allowPlainTextFinal = fals
   if (packets.size > 1) throw new Error('The reply contains conflicting protocol objects for this request. No tools were executed.');
   if (packets.size && malformedCurrent) throw formatError('The reply contains both valid and malformed protocol objects. No tools were executed.');
   if (!packets.size) {
+    if (malformedFinalCandidate) {
+      return malformedFinalCandidate;
+    }
     if (seenOtherRequest) {
       if (isIdenticalStaleReply) {
         throw new Error('The reply requestId does not match. No tools were executed.');
