@@ -657,3 +657,39 @@ test('provider emits live streaming phase and character progress via onStatus wi
   assert.ok(statuses.some(s => /Sending to Copilot \(think\)/.test(s)));
   assert.ok(statuses.some(s => /Drafting answer \(think, 0\.5K chars\)/.test(s)));
 });
+
+test('provider re-reads latest DOM reply once at 0 web quota when a lazy code block mounts right after settle', async () => {
+  let askCount = 0;
+  let rereadCount = 0;
+  let lastReqId = null;
+  const provider = createCopilotProvider({
+    async ask(prompt) {
+      askCount++;
+      const req = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+      lastReqId = req.requestId;
+      // Simulate empty gap between markers while M365 lazy code card is still mounting.
+      return {
+        completed: true,
+        text: `<<<COPILOT_REPLY_START:${req.requestId}>>>\n\n<<<COPILOT_REPLY_END:${req.requestId}>>>`,
+        codeBlocks: []
+      };
+    },
+    async readLatestReply() {
+      rereadCount++;
+      const json = JSON.stringify({ requestId: lastReqId, type: 'final', lines: ['Recovered at 0 quota!'] });
+      return {
+        completed: true,
+        text: `<<<COPILOT_REPLY_START:${lastReqId}>>>\n${json}\n<<<COPILOT_REPLY_END:${lastReqId}>>>`,
+        codeBlocks: [json]
+      };
+    }
+  }, { rereadDelayMs: 10 });
+
+  const stream = provider.streamSimple(provider.getModels()[0], normalizeContext(base), { sessionId: 'reread-s' });
+  for await (const _ of stream) {}
+  const res = await stream.result();
+  assert.equal(res.stopReason, 'stop');
+  assert.equal(res.content[0].text, 'Recovered at 0 quota!');
+  assert.equal(askCount, 1, 'Must NOT burn a repair web turn when DOM re-read recovers the mounted code block');
+  assert.equal(rereadCount, 1);
+});

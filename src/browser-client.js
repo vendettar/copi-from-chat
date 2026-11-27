@@ -291,6 +291,18 @@ export class SharedBrowserClient {
     }
   }
 
+  async readLatestReply({ signal } = {}) {
+    const info = await this._connect({ startIfMissing: false, signal });
+    if (!info) return null;
+    try {
+      const response = await this._request(info, 'GET', `/sessions/${encodeURIComponent(this.sessionId)}/latest-reply`, undefined, { signal });
+      const data = await response.json();
+      return data?.reply ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async ask(message, { signal, fresh = false, requireContinuation = false, previousRequestId, modelPreference, turnContext, onSnapshot = () => {}, onStatus = () => {} } = {}) {
     if (this.busy) {
       throw Object.assign(new Error('A browser request is already in progress.'), { beforeSend: true });

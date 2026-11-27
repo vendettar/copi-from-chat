@@ -188,6 +188,18 @@ async function fixture(t, config = {}) {
         reply.textContent = 'Thinking';
         document.getElementById('replies').append(reply);
         setTimeout(() => {
+          if (config.lazyCodeBlock && window.sent.length === 1) {
+            reply.innerHTML = '<div>&lt;&lt;&lt;COPILOT_REPLY_START:r1-lazy&gt;&gt;&gt;</div><div class="fui-codeBlock" id="lazy-slot"></div><div>&lt;&lt;&lt;COPILOT_REPLY_END:r1-lazy&gt;&gt;&gt;</div>';
+            reply.setAttribute('aria-busy', 'false');
+            stop.hidden = true;
+            setTimeout(() => {
+              const slot = document.getElementById('lazy-slot');
+              if (slot) {
+                slot.innerHTML = '<div class="header">JSON</div><div class="line-numbers">1</div><pre><code>{"requestId":"r1-lazy","type":"final","lines":["Mounted lazily!"]}</code></pre>';
+              }
+            }, 2200);
+            return;
+          }
           reply.textContent = config.firstReplyText && window.sent.length === 1 ? config.firstReplyText : ('Reply ' + window.sent.length);
           reply.setAttribute('aria-busy', 'false');
           stop.hidden = true;
@@ -511,4 +523,23 @@ test('ignores a remounted stale previous assistant bubble during continuation an
   assert.equal(second.completed, true);
   assert.match(second.text, /r2-new/);
   assert.doesNotMatch(second.text, /r1-old/);
+});
+
+test('waits for M365 lazy-mounted code blocks before settling and preserves continuation after post-render toolbar edits', async t => {
+  const browser = await fixture(t, { initialIndex: 2, lazyCodeBlock: true });
+  if (!browser) return;
+
+  const reply = await browser.ask('First turn with lazy code card.', { fresh: true });
+  assert.equal(reply.completed, true);
+  assert.equal(reply.codeBlocks.length, 1, 'Outer codeBlock wrapper must not duplicate <pre><code>');
+  assert.equal(reply.codeBlocks[0], '{"requestId":"r1-lazy","type":"final","lines":["Mounted lazily!"]}');
+
+  // Even if M365 mutates toolbar DOM after settle, hasContinuation stays true because reply count & markerId match.
+  await browser.page.evaluate(() => {
+    const slot = document.getElementById('lazy-slot');
+    const badge = document.createElement('span');
+    badge.textContent = 'Copy code';
+    slot?.prepend(badge);
+  });
+  assert.equal(await browser.hasContinuation(), true);
 });

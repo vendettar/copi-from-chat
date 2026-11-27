@@ -223,7 +223,7 @@ export async function startBrowserHost({
         return;
       }
 
-      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach|warm|models|model|reset|status|dom-health)$/.exec(pathname);
+      const match = /^\/sessions\/([^/]+)\/(attach|continuation|turn|ask|abort|detach|warm|models|model|reset|status|dom-health|latest-reply)$/.exec(pathname);
       if (!match) return sendJson(res, 404, { error: 'Not found' });
 
       const sessionId = decodeURIComponent(match[1]);
@@ -235,6 +235,12 @@ export async function startBrowserHost({
           ? await entry.tab.inspectDomHealth()
           : { pageOpen: false, composerCount: 0, sendButtonVisible: false, pickerFound: false, replyCount: 0 };
         return sendJson(res, 200, health);
+      }
+
+      if (req.method === 'GET' && action === 'latest-reply') {
+        const entry = sessions.get(sessionId);
+        const reply = entry ? await entry.tab.readLatestReply() : null;
+        return sendJson(res, 200, { reply });
       }
 
       if (req.method === 'GET' && action === 'status') {

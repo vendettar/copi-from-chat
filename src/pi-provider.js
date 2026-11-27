@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createProvider, createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools } from '@earendil-works/pi-ai';
 import { compactBootstrapMessages, PROACTIVE_COMPACTION_THRESHOLD, DEFAULT_KEEP_RECENT } from './compaction.js';
 import { DEFAULT_MODEL_PREFERENCE, resolveEffectivePreference } from './model-preference.js';
@@ -431,6 +432,7 @@ export function createCopilotProvider(browser, {
   autoRotateTurns = DEFAULT_AUTO_ROTATE_TURNS,
   autoRotateChars = DEFAULT_AUTO_ROTATE_CHARS,
   minTurnsForCharRotate = MIN_TURNS_FOR_CHAR_ROTATE,
+  rereadDelayMs = 1500,
   compactionThreshold = PROACTIVE_COMPACTION_THRESHOLD,
   keepRecent = DEFAULT_KEEP_RECENT,
   control
@@ -695,7 +697,8 @@ export function createCopilotProvider(browser, {
           }
 
           let reply = response.reply;
-          for (let correction = 0; ; correction++) {
+          let rereadUsedForTurn = false;
+          for (let correction = 0; ; ) {
             options.signal?.throwIfAborted();
             try {
               const packet = parseReply(reply, current.requestId, tools, {
@@ -705,6 +708,25 @@ export function createCopilotProvider(browser, {
               lastReplySignature = replySignatureOf(reply);
               return { packet, requestId: current.requestId };
             } catch (error) {
+              // Zero-quota DOM re-read: if M365's lazy-loaded code card hadn't mounted yet when
+              // the reply settled, wait briefly and re-read the same DOM bubble once before spending a repair turn!
+              if (
+                error.code === 'COPILOT_REPLY_FORMAT'
+                && !rereadUsedForTurn
+                && typeof browser.readLatestReply === 'function'
+                && ((reply?.codeBlocks?.length ?? 0) === 0 || /no protocol object found|incomplete/i.test(error.message))
+              ) {
+                rereadUsedForTurn = true;
+                onStatus('Waiting for webpage code block to finish rendering...');
+                if (rereadDelayMs > 0) await delay(rereadDelayMs, undefined, { signal: options.signal });
+                const refreshed = await browser.readLatestReply({ signal: options.signal }).catch(() => null);
+                if (refreshed && replySignatureOf(refreshed) !== replySignatureOf(reply)) {
+                  await onActivity('reply_dom_reread_recovered', { sessionId, requestId: current.requestId });
+                  reply = refreshed;
+                  continue;
+                }
+              }
+
               if (error.code === 'COPILOT_REPLY_FORMAT') {
                 await onActivity('reply_format_error', {
                   sessionId,
@@ -720,12 +742,25 @@ export function createCopilotProvider(browser, {
                 postSendUncertain = true;
                 throw error;
               }
+              correction++;
+              rereadUsedForTurn = false;
               onStatus('Correcting reply format...');
               current = {
                 mode: 'repair', requestId: nextRequestId(), sessionId, replacesRequestId: current.requestId,
                 formatIssue: error.message, tools: wireTools
               };
-              reply = (await ask(current, false, { toolResultTurn: true })).reply;
+              try {
+                reply = (await ask(current, false, { toolResultTurn: true })).reply;
+              } catch (repairError) {
+                if (repairError?.beforeSend === true && repairError?.retryableInFreshChat === true && !options.signal?.aborted) {
+                  await onActivity('repair_fresh_fallback', { sessionId, reason: repairError.code ?? repairError.message });
+                  onStatus('Web chat changed before repair; retrying cleanly in a fresh chat...');
+                  current = await buildBootstrapPayload(nextRequestId(), { resumed: rawMessages.length > 1 });
+                  reply = (await ask(current, true)).reply;
+                } else {
+                  throw repairError;
+                }
+              }
             }
           }
         };

@@ -71,6 +71,12 @@ function readModelControls(elements) {
   });
 }
 
+function extractMarkerId(reply) {
+  const raw = reply?.protocolText ?? reply?.text ?? '';
+  const match = raw.match(/<<<COPILOT_REPLY_START:([^\s>]+)>>>/);
+  return match ? match[1] : null;
+}
+
 // Runs inside the page for both streaming reads and conversation continuity checks.
 function readReply(elements, previous) {
   const last = elements.at(-1);
@@ -80,21 +86,38 @@ function readReply(elements, previous) {
   const states = nodes.flatMap(node => ['aria-busy', 'data-is-streaming', 'data-streaming'].map(name => node.getAttribute(name)));
   const body = owner ?? last;
   const visible = node => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden';
-  const pres = [...body.querySelectorAll('pre')];
+  const queryAllDeep = (root, selector) => {
+    const out = [];
+    const visit = scope => {
+      if (!scope || typeof scope.querySelectorAll !== 'function') return;
+      for (const el of scope.querySelectorAll(selector)) out.push(el);
+      for (const el of scope.querySelectorAll('*')) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(root);
+    return out;
+  };
+  const pres = queryAllDeep(body, 'pre');
   if (body.matches('pre')) pres.unshift(body);
   const blocks = new Set(pres.filter(visible).map(pre => pre.querySelector('code') ?? pre));
-  for (const code of body.querySelectorAll('code, [data-testid*="code" i], [class*="codeBlock" i]')) {
-    if (!code.closest('pre') && visible(code)) {
-      const raw = code.textContent ?? '';
-      if (/^\s*[\[{]/.test(raw) || raw.includes('"requestId"')) blocks.add(code);
-    }
+  for (const code of queryAllDeep(body, 'code, [data-testid*="code" i], [class*="codeBlock" i]')) {
+    if (code.closest('pre') || !visible(code)) continue;
+    // Never add an outer wrapper container that already encloses a <pre> or <code> element.
+    if (code.querySelector('pre, code')) continue;
+    const raw = code.textContent ?? '';
+    if (/^\s*[\[{]/.test(raw) || raw.includes('"requestId"')) blocks.add(code);
   }
   const readCode = node => {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
     if (node.nodeType !== Node.ELEMENT_NODE || /^(BUTTON|STYLE|SCRIPT)$/.test(node.nodeName)) return '';
+    if (node.getAttribute('aria-hidden') === 'true') return '';
+    const cls = typeof node.className === 'string' ? node.className : '';
+    if (/\b(?:line-?numbers?|gutter)\b/i.test(cls)) return '';
     if (node.nodeName === 'BR') return '\n';
     let text = '', previousBlock = false;
-    for (const child of node.childNodes) {
+    const children = node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
+    for (const child of children) {
       if (child.nodeType === Node.COMMENT_NODE || /^(BUTTON|STYLE|SCRIPT)$/.test(child.nodeName)) continue;
       const block = /^(P|DIV)$/.test(child.nodeName);
       if (text && (block || previousBlock) && !text.endsWith('\n')) text += '\n';
@@ -442,9 +465,45 @@ export class CopilotTab {
     if (!this.page || this.page.isClosed() || this.uncertain || this.lastReply?.page !== this.page) return false;
     try {
       const reply = await this.page.locator(RESPONSES).evaluateAll(readReply, null);
-      return !reply.busy && replyFingerprint(reply) === this.lastReply.signature;
+      if (reply.busy || reply.count <= 0) return false;
+      if (replyFingerprint(reply) === this.lastReply.signature) return true;
+      // Resilient fallback: M365 may finish lazy-mounting syntax highlighting or toolbar buttons
+      // shortly after reply settle, mutating the exact DOM string while the same reply remains active.
+      const currentMarker = extractMarkerId(reply);
+      if (this.lastReply.markerId && currentMarker === this.lastReply.markerId && reply.count === this.lastReply.count) {
+        this.lastReply.signature = replyFingerprint(reply);
+        return true;
+      }
+      return false;
     } catch {
       return false;
+    }
+  }
+
+  async readLatestReply() {
+    if (!this.page || this.page.isClosed()) return null;
+    try {
+      const reply = await this.page.locator(RESPONSES).evaluateAll(readReply, null);
+      if (!reply || reply.count <= 0) return null;
+      const stop = this.page.locator('button[data-testid="stop-button"]')
+        .or(this.page.getByRole('button', { name: /^(stop(?: generating(?: response)?| responding)?|停止(?:生成|响应|回應)?)(?:\s*\([^)]*\))?$/i }))
+        .filter({ visible: true }).first();
+      const generating = reply.busy || await stop.isVisible().catch(() => false);
+      if (generating) return null;
+      this.lastReply = {
+        page: this.page,
+        signature: replyFingerprint(reply),
+        count: reply.count,
+        markerId: extractMarkerId(reply)
+      };
+      return {
+        text: reply.text,
+        protocolText: reply.protocolText,
+        codeBlocks: reply.codeBlocks,
+        completed: true
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -995,21 +1054,35 @@ export class CopilotTab {
         if (current && !generating && (sawGenerating || reply.finished)) {
           const signature = JSON.stringify([reply.text, reply.protocolText, reply.codeBlocks]);
           if (candidate !== signature) { candidate = signature; candidateSince = Date.now(); }
-          else if (Date.now() - candidateSince >= 1500) {
-            signal?.throwIfAborted();
-            this.lastReply = { page, signature: replyFingerprint(reply) };
-            let alertText;
-            if (!reply.text.includes('<<<COPILOT_REPLY_START:') && reply.text.length < 1200) {
-              const alertNotice = await readPageAlertNotice(page);
-              if (alertNotice.limited) alertText = alertNotice.excerpt;
+          else {
+            const rawBody = reply.protocolText ?? reply.text ?? '';
+            const hasStartMarker = rawBody.includes('<<<COPILOT_REPLY_START:');
+            const hasJsonBody = rawBody.includes('{') || reply.codeBlocks.some(block => block.includes('{'));
+            // M365 lazy-loads its code-card syntax highlighter on the first code block of a browser session;
+            // while it downloads/mounts, the DOM shows START + blank gap + END with codeBlocks=[].
+            // Wait up to 12s for the code block to mount before declaring the reply settled (0 extra quota!).
+            const requiredSettleMs = hasStartMarker && !hasJsonBody ? 12000 : 1500;
+            if (Date.now() - candidateSince >= requiredSettleMs) {
+              signal?.throwIfAborted();
+              this.lastReply = {
+                page,
+                signature: replyFingerprint(reply),
+                count: reply.count,
+                markerId: extractMarkerId(reply)
+              };
+              let alertText;
+              if (!reply.text.includes('<<<COPILOT_REPLY_START:') && reply.text.length < 1200) {
+                const alertNotice = await readPageAlertNotice(page);
+                if (alertNotice.limited) alertText = alertNotice.excerpt;
+              }
+              return {
+                text: reply.text,
+                protocolText: reply.protocolText,
+                codeBlocks: reply.codeBlocks,
+                completed: true,
+                ...(alertText ? { alertText } : {})
+              };
             }
-            return {
-              text: reply.text,
-              protocolText: reply.protocolText,
-              codeBlocks: reply.codeBlocks,
-              completed: true,
-              ...(alertText ? { alertText } : {})
-            };
           }
         } else { candidate = ''; candidateSince = 0; }
         await delay(300, undefined, { signal });
@@ -1122,6 +1195,11 @@ export class CopilotBrowser {
   async hasContinuation() {
     if (!this.context) return false;
     return this.tab.hasContinuation();
+  }
+
+  async readLatestReply() {
+    if (!this.context) return null;
+    return this.tab.readLatestReply();
   }
 
   async selectModel(options = {}) {
