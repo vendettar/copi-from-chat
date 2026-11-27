@@ -4,7 +4,7 @@ import { basename, dirname, parse, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
-const FALLBACK_IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'vendor', '__pycache__', '.venv', '.idea']);
+const FALLBACK_IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', 'target', 'out', '.gradle', '.next', 'coverage', 'vendor', '__pycache__', '.venv', '.idea']);
 const FALLBACK_MAX_DEPTH = 8;
 const FALLBACK_MAX_FILES = 2000;
 const FALLBACK_MAX_FILE_BYTES = 256 * 1024;

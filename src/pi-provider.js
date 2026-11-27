@@ -127,19 +127,38 @@ function readCacheKey(path, offset, limit) {
   const norm = normalizeReadPath(path);
   const start = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Number(offset) : 1;
   const count = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Number(limit) : null;
-  return `${norm}::${start}::${count ?? 'all'}`;
+  return `read::${norm}::${start}::${count ?? 'all'}`;
 }
 
-function indexReadCalls(rawMessages) {
+function searchCacheKey(toolName, args = {}) {
+  const norm = normalizeReadPath(args.path ?? '.');
+  const pattern = String(args.pattern ?? '');
+  const limit = Number.isFinite(Number(args.limit)) ? Number(args.limit) : 50;
+  if (toolName === 'grep') {
+    return `grep::${norm}::${pattern}::${args.glob ?? ''}::${args.literal !== false}::${Boolean(args.ignoreCase)}::${Number(args.context) || 0}::${limit}`;
+  }
+  return `find::${norm}::${pattern}::${limit}`;
+}
+
+function indexCacheableCalls(rawMessages) {
   const byId = new Map();
   for (const msg of rawMessages) {
     if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
     for (const block of msg.content) {
-      if (block.type === 'toolCall' && block.name === 'read' && block.id && block.arguments?.path) {
+      if (block.type !== 'toolCall' || !block.id || !block.arguments) continue;
+      if (block.name === 'read' && block.arguments.path) {
         byId.set(block.id, {
+          toolName: 'read',
           path: block.arguments.path,
           offset: block.arguments.offset,
           limit: block.arguments.limit
+        });
+      } else if ((block.name === 'grep' || block.name === 'find') && block.arguments.pattern) {
+        byId.set(block.id, {
+          toolName: block.name,
+          path: block.arguments.path ?? '.',
+          pattern: block.arguments.pattern,
+          args: block.arguments
         });
       }
     }
@@ -147,28 +166,30 @@ function indexReadCalls(rawMessages) {
   return byId;
 }
 
-function dedupeRepeatedReadResults(messages, readCallsById, tabReadCache) {
+function dedupeRepeatedReadResults(messages, callsById, tabReadCache) {
   if (!Array.isArray(messages) || !tabReadCache) return messages;
   let changed = false;
   const next = messages.map(msg => {
-    if (msg.role !== 'toolResult' || msg.toolName !== 'read' || msg.isError) return msg;
-    const call = readCallsById.get(msg.toolCallId);
-    if (!call) return msg;
+    if (msg.role !== 'toolResult' || msg.isError) return msg;
+    if (!['read', 'grep', 'find'].includes(msg.toolName)) return msg;
+    const call = callsById.get(msg.toolCallId);
+    if (!call || call.toolName !== msg.toolName) return msg;
     const text = textOfMessage(msg);
     if (text.length < MIN_READ_DEDUP_CHARS) return msg;
-    const key = readCacheKey(call.path, call.offset, call.limit);
+    const key = call.toolName === 'read'
+      ? readCacheKey(call.path, call.offset, call.limit)
+      : searchCacheKey(call.toolName, call.args);
     const digest = hashText(text);
     const prev = tabReadCache.get(key);
     if (prev && prev.hash === digest) {
       changed = true;
       const norm = normalizeReadPath(call.path);
-      const source = prev.preloaded ? 'preloaded' : 'read';
+      const stub = call.toolName === 'read'
+        ? `[Already ${prev.preloaded ? 'preloaded' : 'read'} in this web conversation (${norm}, unchanged — ${text.length} chars omitted to save context).]`
+        : `[Already ${call.toolName === 'grep' ? 'grepped' : 'found'} in this web conversation ("${call.pattern}" in ${norm}, unchanged — ${text.length} chars omitted to save context).]`;
       return {
         ...msg,
-        content: [{
-          type: 'text',
-          text: `[Already ${source} in this web conversation (${norm}, unchanged — ${text.length} chars omitted to save context).]`
-        }]
+        content: [{ type: 'text', text: stub }]
       };
     }
     tabReadCache.set(key, { hash: digest, chars: text.length, preloaded: false });
@@ -179,34 +200,34 @@ function dedupeRepeatedReadResults(messages, readCallsById, tabReadCache) {
 
 export function promptFor(payload) {
   if (payload.mode === 'continue') {
-    return `Continue after previousRequestId with established systemPrompt/tools. messages has ONLY new input or toolResults; calls run sequentially in order (e.g. [edit, bash]).
-Reply using NEW requestId "${payload.requestId}" (NOT previousRequestId), wrapped in a \`\`\`json code block (required to preserve backslashes/quotes):
+    return `Continue after previousRequestId with established systemPrompt/tools; messages has ONLY new input/toolResults. Calls run sequentially (e.g. [edit, bash]).
+Reply with NEW requestId "${payload.requestId}" (NOT previousRequestId) inside ONE \`\`\`json block:
 <<<COPILOT_REPLY_START:${payload.requestId}>>>
 \`\`\`json
 {"requestId":"${payload.requestId}","type":"final","lines":[...]}
 \`\`\`
 <<<COPILOT_REPLY_END:${payload.requestId}>>>
-(Or {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"...","arguments":{}}]} inside \`\`\`json.)
+Or {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"...","arguments":{}}]} inside \`\`\`json.
 TASK_CONTEXT_JSON:
 ${JSON.stringify(payload)}`;
   }
 
   if (payload.mode === 'repair') {
-    return `FORMAT CORRECTION for replacesRequestId: your previous reply violated the response format, so NO local tools ran. Fix formatIssue and emit the same intended response using NEW requestId "${payload.requestId}". Do not invent tool results.
-Wrap ONE single-line JSON object inside a \`\`\`json code fence (required so webpage Markdown does not strip backslashes; for final use "lines" array with one Markdown line per item):
+    return `FORMAT CORRECTION for replacesRequestId: previous reply broke the JSON format, so NO local tools ran. Fix formatIssue and re-emit the intended response with NEW requestId "${payload.requestId}" (do not invent tool results).
+Wrap ONE single-line ASCII JSON object inside \`\`\`json (for final use "lines" array, one Markdown line per item):
 <<<COPILOT_REPLY_START:${payload.requestId}>>>
 \`\`\`json
 {"requestId":"${payload.requestId}","type":"final","lines":["..."]}
 \`\`\`
 <<<COPILOT_REPLY_END:${payload.requestId}>>>
-(Or {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]} inside \`\`\`json.)
+Or {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]} inside \`\`\`json.
 TASK_CONTEXT_JSON:
 ${JSON.stringify(payload)}`;
   }
 
   const bootstrapLead = payload.resumed
-    ? 'Coding assistant restoring a saved local session into a fresh web chat. Follow systemPrompt and tools. messages holds restored context (initial task, compacted summary when applicable, recent turns). Do not repeat completed work; continue from the latest user message.'
-    : 'Coding assistant starting a local session in this web chat. Follow systemPrompt and tools. messages holds the initial task (and any preloaded workspace/file context).';
+    ? 'Coding assistant restoring a saved local session into a fresh web chat. Follow systemPrompt/tools. messages holds restored context (initial task, compacted summary if any, recent turns); continue from the latest user message without repeating completed work.'
+    : 'Coding assistant starting a local session in this web chat. Follow systemPrompt/tools. messages holds the initial task (and any preloaded workspace/file context).';
 
   return `${bootstrapLead}
 Later mode=continue requests send ONLY new messages; keep systemPrompt, tools, and history in memory.
@@ -226,7 +247,7 @@ Or for tool calls (inside the same markers and \`\`\`json fence):
 \`\`\`json
 {"requestId":"${payload.requestId}","type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]}
 \`\`\`
-Rules: final uses "lines" (one Markdown line per string, "" for blank lines, code fences/lines as separate items; no literal \\n layout breaks; preserve intentional escapes). Escape JSON strings once (actual newlines in tool args -> \\n; literal \\n -> \\\\n). Copy requestId verbatim. Prefer forward slashes in Windows paths. No extra commentary outside the markers.
+Rules: final uses "lines" (one Markdown line per string, "" for blank lines, code fences/lines as separate items; no literal \\n layout breaks; preserve intentional escapes). Escape JSON strings once (actual newlines in tool args -> \\n; literal \\n -> \\\\n). Copy requestId verbatim. Reply concisely in the user's language; keep code, comments, tool args, and JSON syntax/quotes in standard ASCII/English. Prefer forward slashes in Windows paths. No commentary outside markers.
 TASK_CONTEXT_JSON:
 ${JSON.stringify(payload)}`;
 }
@@ -451,6 +472,17 @@ export function parseReply(reply, requestId, tools, { allowPlainTextFinal = fals
       if (/\\[rn]/.test(packet.text)) throw formatError('final.text contains literal backslash-n or backslash-r sequences. Return final.lines with one item per intended Markdown line. Preserve intentional escapes in code and paths; do not replace them blindly.');
       return packet;
     }
+    // Zero-quota normalization for read-only final replies: never burn a repair turn just because
+    // a lines item contained an embedded newline or an extra harmless field alongside lines/text.
+    if (allowPlainTextFinal) {
+      if (Array.isArray(packet.lines) && packet.lines.length && packet.lines.every(line => typeof line === 'string')) {
+        const normalized = packet.lines.flatMap(line => line.replace(/\r\n/g, '\n').split(/\r|\n/)).join('\n');
+        if (normalized.trim()) return { requestId, type: 'final', text: normalized, normalizedFinal: true };
+      }
+      if (typeof packet.text === 'string' && packet.text.trim() && !/\\[rn]/.test(packet.text)) {
+        return { requestId, type: 'final', text: packet.text, normalizedFinal: true };
+      }
+    }
     throw formatError('Invalid final response. Return lines as a nonempty array of strings, one Markdown line per item, without a text field.');
   }
   if (packet.type !== 'tool_calls' || !Array.isArray(packet.calls) || !packet.calls.length
@@ -553,7 +585,7 @@ export function createCopilotProvider(browser, {
         const systemPrompt = getCurrentSystemPrompt(context.messages);
         const wireSystemPrompt = compactWireSystemPrompt(systemPrompt);
         const rawMessages = transcript(context.messages);
-        const readCallsById = indexReadCalls(rawMessages);
+        const cacheableCallsById = indexCacheableCalls(rawMessages);
         const history = rawMessages.map(message => JSON.stringify(message));
         const catalog = JSON.stringify([systemPrompt, tools]);
 
@@ -641,7 +673,7 @@ export function createCopilotProvider(browser, {
           }
           let messagesForWire = payload.messages;
           if (messagesForWire) {
-            messagesForWire = dedupeRepeatedReadResults(messagesForWire, readCallsById, tabReadCache);
+            messagesForWire = dedupeRepeatedReadResults(messagesForWire, cacheableCallsById, tabReadCache);
             messagesForWire = await limitToolResults(messagesForWire, { signal: options.signal, save: saveToolOutput });
           }
           const outgoing = payload.messages ? { ...payload, messages: messagesForWire } : payload;
@@ -757,6 +789,9 @@ export function createCopilotProvider(browser, {
                 allowPlainTextFinal,
                 previousReplySignature: lastReplySignature
               });
+              if (packet.recoveredMalformedFinal) {
+                await onActivity('reply_malformed_final_recovered', { sessionId, requestId: current.requestId });
+              }
               lastReplySignature = replySignatureOf(reply);
               return { packet, requestId: current.requestId };
             } catch (error) {

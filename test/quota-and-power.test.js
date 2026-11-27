@@ -712,3 +712,129 @@ test('provider re-reads latest DOM reply once at 0 web quota when a lazy code bl
   assert.equal(askCount, 1, 'Must NOT burn a repair web turn when DOM re-read recovers the mounted code block');
   assert.equal(rereadCount, 1);
 });
+
+test('bootstrap enforces concise ASCII/English wire discipline, continue header stays ultra-lean, and final normalization saves repair quota', () => {
+  const boot = promptFor({ mode: 'bootstrap', requestId: 'r1-aaaa', sessionId: 's1', systemPrompt: 'Work.', messages: [], tools: [] });
+  assert.match(boot, /Reply concisely in the user's language; keep code, comments, tool args, and JSON syntax\/quotes in standard ASCII\/English/);
+
+  const cont = promptFor({ mode: 'continue', requestId: 'r2-bbbb', sessionId: 's1', previousRequestId: 'r1-aaaa', messages: [] });
+  const headerOnly = cont.split('\nTASK_CONTEXT_JSON:\n')[0];
+  assert.ok(headerOnly.length < 480, `continue header should stay lean (<480 chars), got ${headerOnly.length}`);
+
+  // Embedded newline inside final.lines normalizes locally at 0 quota when allowPlainTextFinal is enabled.
+  const embeddedNl = JSON.stringify({ requestId: 'r2-bbbb', type: 'final', lines: ['第一段\n第二段', '第三段'], extraNote: 'ignored' });
+  const normalized = parseReply({ completed: true, text: embeddedNl, codeBlocks: [embeddedNl] }, 'r2-bbbb', [], { allowPlainTextFinal: true });
+  assert.equal(normalized.type, 'final');
+  assert.equal(normalized.text, '第一段\n第二段\n第三段');
+  assert.equal(normalized.normalizedFinal, true);
+
+  // Strict mode (allowPlainTextFinal=false) keeps rejecting embedded newlines so protocol tests stay strict.
+  assert.throws(() => parseReply({ completed: true, text: embeddedNl, codeBlocks: [embeddedNl] }, 'r2-bbbb', [], { allowPlainTextFinal: false }));
+});
+
+test('same-tab grep and find deduplication omits unchanged repeated search outputs and resends when results change', async () => {
+  const requests = [];
+  const grepTool = { name: 'grep', description: 'Search', parameters: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' } }, required: ['pattern'] } };
+  const findTool = { name: 'find', description: 'Find', parameters: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' } }, required: ['pattern'] } };
+  let step = 0;
+  const provider = createCopilotProvider({
+    async ask(prompt) {
+      step++;
+      const req = JSON.parse(prompt.split('\nTASK_CONTEXT_JSON:\n')[1]);
+      requests.push(req);
+      if (step === 1 || step === 3 || step === 5) {
+        return mkReply(req, {
+          type: 'tool_calls',
+          calls: [
+            { name: 'grep', arguments: { pattern: 'NullPointerException', path: 'src' } },
+            { name: 'find', arguments: { pattern: '*.java', path: 'src' } }
+          ]
+        });
+      }
+      return mkReply(req, { type: 'final', lines: ['Checked.'] });
+    }
+  }, { autoRotateTurns: 25, autoRotateChars: 60000 });
+
+  const run = async msgs => {
+    const s = provider.streamSimple(provider.getModels()[0], normalizeContext({ systemPrompt: 'Work.', messages: msgs, tools: [grepTool, findTool] }), { sessionId: 'search-dedup' });
+    for await (const _ of s) {}
+    return s.result();
+  };
+
+  const grepBody = Array.from({ length: 20 }, (_, i) => `src/Service.java:${i + 1}: NullPointerException in handler_${i}`).join('\n');
+  const findBody = Array.from({ length: 25 }, (_, i) => `src/main/java/com/acme/Service${i}.java`).join('\n');
+  const changedGrep = `${grepBody}\nsrc/Service.java:99: new NullPointerException`;
+
+  let msgs = [user('Search')];
+  const a1 = await run(msgs);
+  msgs = [...msgs, a1,
+    { role: 'toolResult', toolCallId: a1.content[0].id, toolName: 'grep', isError: false, content: [{ type: 'text', text: grepBody }], timestamp: 2 },
+    { role: 'toolResult', toolCallId: a1.content[1].id, toolName: 'find', isError: false, content: [{ type: 'text', text: findBody }], timestamp: 2 }
+  ];
+  const a2 = await run(msgs);
+  assert.equal(requests[1].messages[0].content[0].text, grepBody);
+  assert.equal(requests[1].messages[1].content[0].text, findBody);
+
+  // Repeat identical grep + find in same tab -> both deduped!
+  msgs = [...msgs, a2, user('Search again')];
+  const a3 = await run(msgs);
+  msgs = [...msgs, a3,
+    { role: 'toolResult', toolCallId: a3.content[0].id, toolName: 'grep', isError: false, content: [{ type: 'text', text: grepBody }], timestamp: 3 },
+    { role: 'toolResult', toolCallId: a3.content[1].id, toolName: 'find', isError: false, content: [{ type: 'text', text: findBody }], timestamp: 3 }
+  ];
+  const a4 = await run(msgs);
+  assert.match(requests[3].messages[0].content[0].text, /Already grepped in this web conversation/);
+  assert.match(requests[3].messages[1].content[0].text, /Already found in this web conversation/);
+
+  // Changed grep output -> sent in full, while unchanged find stays deduped!
+  msgs = [...msgs, a4, user('Search after edit')];
+  const a5 = await run(msgs);
+  msgs = [...msgs, a5,
+    { role: 'toolResult', toolCallId: a5.content[0].id, toolName: 'grep', isError: false, content: [{ type: 'text', text: changedGrep }], timestamp: 4 },
+    { role: 'toolResult', toolCallId: a5.content[1].id, toolName: 'find', isError: false, content: [{ type: 'text', text: findBody }], timestamp: 4 }
+  ];
+  await run(msgs);
+  assert.equal(requests[5].messages[0].content[0].text, changedGrep);
+  assert.match(requests[5].messages[1].content[0].text, /Already found in this web conversation/);
+});
+
+test('workspace snapshot summarizes Maven pom.xml, ignores target/, and preloads head+tail for large CSV/log files', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'copi-java-log-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src', 'main', 'java'), { recursive: true });
+  await mkdir(join(root, 'target', 'classes'), { recursive: true });
+  await writeFile(join(root, 'pom.xml'), [
+    '<project>',
+    '  <parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>3.2.5</version></parent>',
+    '  <groupId>com.example.esub</groupId>',
+    '  <artifactId>esub-pa-service</artifactId>',
+    '  <version>1.4.0</version>',
+    '  <properties><java.version>17</java.version></properties>',
+    '  <modules><module>esub-api</module><module>esub-core</module></modules>',
+    '  <dependencies><dependency><groupId>org.junit</groupId><artifactId>junit</artifactId></dependency></dependencies>',
+    '</project>'
+  ].join('\n'));
+  await writeFile(join(root, 'src', 'main', 'java', 'App.java'), 'class App {}\n');
+  await writeFile(join(root, 'target', 'classes', 'Ignored.class'), 'bin');
+
+  const snap = await collectWorkspaceSnapshot(root);
+  assert.match(snap, /pom\.xml: com\.example\.esub:esub-pa-service:1\.4\.0/);
+  assert.match(snap, /parent: spring-boot-starter-parent@3\.2\.5/);
+  assert.match(snap, /java: 17/);
+  assert.match(snap, /modules: esub-api, esub-core/);
+  assert.ok(!snap.includes('Ignored.class'), 'target/ build artifacts must be ignored in workspace snapshot');
+
+  // Large CSV error log preload includes BOTH header row AND latest tail error entry!
+  const csvRows = ['timestamp,level,service,message'];
+  for (let i = 1; i <= 120; i++) {
+    csvRows.push(`2026-11-27T01:${String(i % 60).padStart(2, '0')}:00Z,INFO,esub-pa,heartbeat ok row=${i} payload=xxxxxxxxxxxxxxxx`);
+  }
+  csvRows.push('2026-11-27T02:59:59Z,ERROR,esub-pa,FATAL_LATEST_ERROR_MARKER NullPointerException at PaController.java:88');
+  await writeFile(join(root, 'error_log.csv'), csvRows.join('\n'));
+
+  const expanded = await expandFileMentions('Check error_log.csv for the latest failure', root);
+  assert.deepEqual(expanded.loadedFiles, ['error_log.csv']);
+  assert.match(expanded.text, /timestamp,level,service,message/);
+  assert.match(expanded.text, /middle omitted:.*total lines/);
+  assert.match(expanded.text, /FATAL_LATEST_ERROR_MARKER/);
+});

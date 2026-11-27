@@ -491,8 +491,7 @@ export async function createRuntime({
       control: providerControl
     }));
     const appendSystemPrompt = [
-      'Use Bash syntax and forward-slash paths on Windows. Use grep and find for project search; use bash for commands, builds, and tests. ' +
-      'Calls in one tool_calls turn run sequentially in order, so batch reads/searches together and chain dependent edits with bash verification (e.g. [edit, bash("npm test")]) in a single turn.'
+      'Environment: Windows Git Bash; use Bash syntax and forward-slash paths. Use grep and find for project search; use bash for commands, builds, and tests.'
     ];
     if (projectInstructions.promptSection) {
       appendSystemPrompt.push(projectInstructions.promptSection);

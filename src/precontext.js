@@ -5,7 +5,8 @@ import { promisify } from 'node:util';
 import { normalizeCliPath } from './paths.js';
 
 const exec = promisify(execFile);
-const IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'vendor', '__pycache__', '.venv']);
+const IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', 'target', 'out', '.gradle', '.next', 'coverage', 'vendor', '__pycache__', '.venv']);
+const HEAD_TAIL_PRELOAD_EXTS = new Set(['.log', '.csv', '.tsv', '.out', '.txt']);
 const SKIP_PRELOAD_EXTS = new Set([
   '.jar', '.war', '.ear', '.zip', '.tar', '.gz', '.tgz', '.7z', '.rar', '.class',
   '.exe', '.dll', '.so', '.dylib', '.bin', '.obj', '.o', '.a',
@@ -52,6 +53,35 @@ async function listWorkspaceFiles(cwd, limit = MAX_SNAPSHOT_FILES) {
   }
 }
 
+function summarizePomXml(raw) {
+  const xml = raw.replace(/<!--[\s\S]*?-->/g, '');
+  const parentBlock = xml.match(/<parent>([\s\S]*?)<\/parent>/)?.[1] ?? '';
+  const withoutNested = xml
+    .replace(/<parent>[\s\S]*?<\/parent>/g, '')
+    .replace(/<dependencies>[\s\S]*?<\/dependencies>/g, '')
+    .replace(/<dependencyManagement>[\s\S]*?<\/dependencyManagement>/g, '')
+    .replace(/<build>[\s\S]*?<\/build>/g, '')
+    .replace(/<profiles>[\s\S]*?<\/profiles>/g, '')
+    .replace(/<properties>[\s\S]*?<\/properties>/g, '');
+  const tag = (src, name) => src.match(new RegExp(`<${name}>\\s*([^<\\s][^<]*?)\\s*</${name}>`))?.[1]?.trim() ?? '';
+  const groupId = tag(withoutNested, 'groupId') || tag(parentBlock, 'groupId');
+  const artifactId = tag(withoutNested, 'artifactId');
+  const version = tag(withoutNested, 'version') || tag(parentBlock, 'version');
+  const packaging = tag(withoutNested, 'packaging');
+  const parentArtifact = tag(parentBlock, 'artifactId');
+  const parentVersion = tag(parentBlock, 'version');
+  const javaVer = xml.match(/<(?:java\.version|maven\.compiler\.(?:release|source))>\s*([^<\s]+)\s*<\//)?.[1]?.trim() ?? '';
+  const modules = [...xml.matchAll(/<module>\s*([^<\s][^<]*?)\s*<\/module>/g)].map(m => m[1].trim()).filter(Boolean);
+  const coord = [groupId, artifactId, version].filter(Boolean).join(':');
+  const parts = [
+    coord ? `pom.xml: ${coord}${packaging ? ` (${packaging})` : ''}` : 'pom.xml',
+    parentArtifact ? `parent: ${parentArtifact}${parentVersion ? `@${parentVersion}` : ''}` : '',
+    javaVer ? `java: ${javaVer}` : '',
+    modules.length ? `modules: ${modules.slice(0, 12).join(', ')}${modules.length > 12 ? ', ...' : ''}` : ''
+  ].filter(Boolean);
+  return parts.length > 1 || coord ? parts.join(' | ') : '';
+}
+
 async function readManifestSummary(cwd) {
   try {
     const pkg = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf8'));
@@ -66,10 +96,16 @@ async function readManifestSummary(cwd) {
     ].filter(Boolean).join(' | ');
   } catch { /* not a node package */ }
 
-  for (const name of ['pyproject.toml', 'Cargo.toml', 'go.mod']) {
+  try {
+    const pomRaw = await readFile(join(cwd, 'pom.xml'), 'utf8');
+    const summary = summarizePomXml(pomRaw);
+    if (summary) return summary;
+  } catch { /* not a maven project */ }
+
+  for (const name of ['build.gradle.kts', 'build.gradle', 'pyproject.toml', 'Cargo.toml', 'go.mod']) {
     try {
       const raw = await readFile(join(cwd, name), 'utf8');
-      const head = raw.split(/\r?\n/).slice(0, 12).join('\n').trim();
+      const head = raw.split(/\r?\n/).filter(l => l.trim()).slice(0, 12).join('\n').trim();
       if (head) return `${name}:\n${head}`;
     } catch { /* ignore */ }
   }
@@ -209,7 +245,15 @@ export async function expandFileMentions(prompt, cwd, {
 
     let truncated = false;
     if (snippet.length > budget) {
-      snippet = `${snippet.slice(0, budget)}\n... [truncated; use read with offset/limit for more]`;
+      if (startLine === null && HEAD_TAIL_PRELOAD_EXTS.has(ext) && budget >= 600) {
+        const totalLines = raw.split(/\r?\n/).length;
+        const headBudget = Math.floor((budget - 110) * 0.58);
+        const tailBudget = Math.max(120, budget - 110 - headBudget);
+        const omitted = Math.max(0, snippet.length - headBudget - tailBudget);
+        snippet = `${snippet.slice(0, headBudget)}\n... [middle omitted: ${omitted} chars, ${totalLines} total lines; use grep or read offset/limit for details] ...\n${snippet.slice(-tailBudget)}`;
+      } else {
+        snippet = `${snippet.slice(0, budget)}\n... [truncated; use read with offset/limit for more]`;
+      }
       truncated = true;
     }
 
